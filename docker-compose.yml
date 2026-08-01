@@ -1,0 +1,55 @@
+# =============================================================================
+# docker-compose.yml -- saves you from typing a 200-character `docker run`.
+#
+# Without this file, starting the container looks like:
+#
+#   docker run -it --rm --platform linux/arm64 \
+#       -v "$PWD":/work -w /work --shm-size 2g \
+#       tissue-dynamics/surrol:latest bash
+#
+# With it:  docker compose run --rm surrol
+#
+# Same thing. The settings live in a file you can read instead of in your shell
+# history, which matters when you come back to this in three months.
+# =============================================================================
+
+services:
+  # "surrol" is just a name you pick. It is what you type in the command above.
+  surrol:
+    build:
+      # Where to look for the Dockerfile. Paths are relative to THIS file.
+      context: ./docker
+      dockerfile: Dockerfile
+
+    # Tag the built image so `docker images` shows something recognisable.
+    image: tissue-dynamics/surrol:latest
+
+    # Be explicit that this is an ARM64 image. On your M3 that is native speed.
+    # If you ever remove this line on an Intel machine, Docker would emulate
+    # x86 and run roughly 5x slower without telling you.
+    platform: linux/arm64
+
+    volumes:
+      # "bind mount": the folder on the left (your Mac) appears at the path on
+      # the right (inside the container). `.` is this project folder.
+      #
+      # This is THE key mechanism of the whole setup. Files the container
+      # writes to /work/data land in ~/tissue-dynamics/data on your Mac
+      # instantly, where your host Python can read them. Nothing is copied and
+      # nothing needs syncing.
+      #
+      # It also means container work is not lost when the container exits --
+      # which it will, every time, because of `--rm`.
+      - .:/work
+
+    working_dir: /work
+
+    # Keep stdin open and allocate a terminal. Without these two, an
+    # interactive bash session exits immediately.
+    stdin_open: true
+    tty: true
+
+    # Docker's default 64MB of shared memory is too small for physics engines
+    # that use multiple worker processes. Raising it avoids confusing
+    # "bus error" crashes under load.
+    shm_size: "2gb"

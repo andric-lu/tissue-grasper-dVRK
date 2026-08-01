@@ -1,0 +1,52 @@
+# =============================================================================
+# environment.yml -- the recipe for the HOST (macOS-native) Python environment.
+#
+# This is the GPU side. Everything here runs directly on macOS so it can reach
+# Apple's Metal API: PyTorch through the MPS backend, Taichi through its Metal
+# backend. Neither of those works inside a container, which is the entire
+# reason this project has two environments instead of one.
+#
+# Create it with:   conda env create -f host/environment.yml
+# Update it later:  conda env update -f host/environment.yml --prune
+# =============================================================================
+
+name: tissue-host
+
+channels:
+  # conda-forge is a community channel with far better Apple Silicon coverage
+  # than Anaconda's default channel. Miniforge uses it by default; listing it
+  # explicitly means this file behaves the same on any machine.
+  - conda-forge
+
+dependencies:
+  # Python 3.11: comfortably inside Taichi 1.7.4's supported range (3.9-3.13),
+  # fully supported by PyTorch, and mature enough that every package you want
+  # has a prebuilt ARM64 wheel. 3.13 would work but you would be first in line
+  # for packaging bugs, which is not where you want to be while learning.
+  - python=3.11
+
+  # Install from conda where a compiled library is involved -- conda ships
+  # binaries built to work together, which avoids a class of "works on my
+  # machine" linker problems.
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - jupyterlab      # notebooks are the right tool for inspecting trajectories
+  - pip             # so the pip: block below can run
+
+  - pip:
+    # PyTorch is installed via pip. On Apple Silicon the standard PyPI wheel
+    # already includes the MPS (Metal Performance Shaders) backend -- there is
+    # no separate "GPU version" to hunt down, unlike CUDA on Linux.
+    - torch
+    - torchvision
+
+    # Taichi: the MPM soft-body work. `ti.init(arch=ti.metal)` runs kernels on
+    # the M3 Max GPU. There is no ARM Linux build of Taichi at all, so this
+    # package is a concrete reason the host side has to exist.
+    - taichi==1.7.4
+
+    # Reading trajectories and rendering meshes for inspection.
+    - trimesh
+    - tqdm

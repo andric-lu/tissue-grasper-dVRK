@@ -1,0 +1,34 @@
+# Files git should ignore. Without this, `git status` is unreadable noise and
+# you will eventually commit a 4 GB dataset to a repository by accident.
+
+# --- Simulation output -------------------------------------------------------
+# Data is regenerable from code + seed, and it is large. Version the SCRIPT that
+# produces the data, not the data. If a dataset is precious, back it up
+# somewhere designed for large files, not in git.
+data/*.npz
+data/**/*.npz
+models/*.pt
+runs/
+*.mp4
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- Environments ------------------------------------------------------------
+# Never commit an environment folder. environment.yml is the reproducible
+# artifact; the installed environment is machine-specific and enormous.
+.venv/
+venv/
+env/
+
+# --- macOS -------------------------------------------------------------------
+.DS_Store
+
+# --- Editors -----------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
