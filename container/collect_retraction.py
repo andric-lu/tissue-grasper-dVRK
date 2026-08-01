@@ -64,20 +64,29 @@ from trajectory_io import TrajectoryWriter  # noqa: E402
 # --------------------------------------------------------------------------
 # Parameters. Units: metres, seconds, kilograms.
 # --------------------------------------------------------------------------
-DT = 1.0 / 240.0          # physics timestep; 240 Hz is PyBullet's default and
+DT = 1.0 / 1000.0          # physics timestep; 240 Hz is PyBullet's default and
                           # deformables become unstable much below it
-SHEET_SCALE = 0.30        # asset scale factor (NOT a size in metres -- the
-                          # resulting extent is measured at runtime)
-SHEET_MASS = 0.10         # kg
-SHEET_DROP_HEIGHT = 0.08  # where the sheet starts before it falls
-SETTLE_TIME = 0.7         # seconds of free settling before anything is recorded
-GRIPPER_HALF = 0.012      # 12 mm half-extent -> 24 mm block
-GRASP_RADIUS = 0.035      # nodes this close to the jaw get anchored
+DEFAULT_MESH = "/work/assets/tissue_20x20.obj"
+SHEET_MASS = 0.05         # kg -- a 10 cm square of tissue-like material
+SETTLE_TIME = 0.7         # seconds of settling before anything is recorded
+GRIPPER_HALF = 0.004      # 4 mm half-extent -> 8 mm jaw, surgical scale
+GRASP_RADIUS = 0.008      # nodes this close to the jaw get anchored
 MIN_GRASP_NODES = 3       # if the radius catches fewer, take this many nearest
 
-APPROACH_HEIGHT = 0.20    # how far above the grasp point the descent starts
-LIFT_HEIGHT = 0.10        # vertical travel during the lift phase
-RETRACT_DIST = 0.12       # lateral travel during the retract phase
+# Motion scaled to a 10 cm sheet. These were 10x larger when the asset was a
+# 60 cm demo cloth; lengths in this file are only meaningful relative to the
+# tissue's own size, so they must move together with it.
+APPROACH_HEIGHT = 0.05    # how far above the grasp point the descent starts
+LIFT_HEIGHT = 0.020       # vertical travel during the lift phase
+RETRACT_DIST = 0.025      # lateral travel during the retract phase
+
+# The perimeter is pinned to the world. This is the difference between
+# retraction and dragging: an unattached sheet just translates under the
+# gripper, recording rigid motion with a little flap and no strain field.
+# Real tissue is continuous with surrounding structure, so pulling it stretches
+# it. Anchoring the boundary is the cheapest honest approximation of that, and
+# it is what makes the recorded deformation worth modelling at all.
+ANCHOR_BOUNDARY = True
 
 PHASES = [                # (name, duration in seconds)
     ("approach", 0.8),    # descend toward the measured grasp point
@@ -93,10 +102,10 @@ PHASES = [                # (name, duration in seconds)
 # Scene
 # --------------------------------------------------------------------------
 
-def build_scene(seed: int):
-    """Create the world, let the sheet settle, and measure where it ended up.
+def build_scene(seed: int, mesh_path: str):
+    """Create the world, pin the sheet's edges, settle, and measure the result.
 
-    Returns (gripper_id, sheet_id, faces, stiffness, damping, settled_positions).
+    Returns (gripper, sheet, faces, stiffness, damping, settled_pos, boundary).
     """
     p.resetSimulation(p.RESET_USE_DEFORMABLE_WORLD)
     # ^ Deformables live in a different world type. Without this flag,
@@ -115,13 +124,13 @@ def build_scene(seed: int):
     # Randomise per episode so the dataset covers a range of conditions rather
     # than N copies of one trajectory. A dynamics model trained on a single
     # stiffness learns that stiffness, not the underlying dynamics.
-    stiffness = float(rng.uniform(25.0, 60.0))
+    stiffness = float(rng.uniform(40.0, 120.0))
     damping = float(rng.uniform(0.05, 0.30))
 
     sheet = p.loadSoftBody(
-        "cloth_z_up.obj",
-        basePosition=[0, 0, SHEET_DROP_HEIGHT],
-        scale=SHEET_SCALE,
+        mesh_path,
+        basePosition=[0, 0, 0],  # the mesh is authored at its resting height
+        scale=1.0,               # authored in metres, so no rescaling
         mass=SHEET_MASS,
         useNeoHookean=0,        # mass-spring, not FEM: less realistic, far more
         useMassSpring=1,        # stable for a first pipeline test
@@ -147,13 +156,35 @@ def build_scene(seed: int):
         basePosition=[0, 0, 1.0],
     )
 
-    # Let the sheet fall and come to rest BEFORE choosing where to grasp.
+    # Pin the perimeter to the world. Passing bodyUniqueId = -1 to
+    # createSoftBodyAnchor means "anchor to the static world" rather than to
+    # another body, which fixes those nodes in place permanently.
+    boundary = boundary_nodes(node_positions(sheet))
+    if ANCHOR_BOUNDARY:
+        for nid in boundary:
+            p.createSoftBodyAnchor(sheet, int(nid), -1, -1)
+
+    # Let the sheet sag into equilibrium BEFORE choosing where to grasp.
     for _ in range(int(SETTLE_TIME / DT)):
         p.stepSimulation()
 
     n, _ = p.getMeshData(sheet, -1, flags=p.MESH_DATA_SIMULATION_MESH)
-    faces = load_obj_faces("cloth_z_up.obj", expect_verts=n)
-    return gripper, sheet, faces, stiffness, damping, node_positions(sheet)
+    faces = load_obj_faces(mesh_path, expect_verts=n)
+    return gripper, sheet, faces, stiffness, damping, node_positions(sheet), boundary
+
+
+def boundary_nodes(pos: np.ndarray, tol: float = 1e-4) -> np.ndarray:
+    """Indices of nodes on the outer edge of the sheet's xy bounding box.
+
+    Geometric rather than topological, so it works for any sheet-like mesh
+    without needing to know how it was generated.
+    """
+    lo, hi = pos[:, :2].min(axis=0), pos[:, :2].max(axis=0)
+    on_edge = (
+        (np.abs(pos[:, 0] - lo[0]) < tol) | (np.abs(pos[:, 0] - hi[0]) < tol) |
+        (np.abs(pos[:, 1] - lo[1]) < tol) | (np.abs(pos[:, 1] - hi[1]) < tol)
+    )
+    return np.where(on_edge)[0].astype(np.int32)
 
 
 def load_obj_faces(obj_name: str, expect_verts: int):
@@ -204,29 +235,54 @@ def node_positions(sheet_id):
     return np.asarray(verts, np.float32)
 
 
-def choose_grasp_point(pos: np.ndarray, rng) -> tuple:
-    """Pick a node to grasp, preferring the interior of the sheet.
+def choose_grasp_point(pos: np.ndarray, rng, margin: float = 0.25) -> tuple:
+    """Pick an interior node to grasp.
 
-    Grasping a corner or edge node produces a flap rather than a retraction, so
-    nodes are scored by distance from the sheet's centroid and the pick is drawn
-    from the closer half. Still random, so episodes differ, but never degenerate.
+    Interior is defined geometrically: inside the central (1 - 2*margin) box of
+    the sheet's xy extent. With `margin=0.25` that is the middle half in each
+    direction, so a pinned edge is never grasped -- pulling a pinned node
+    produces nothing, and pulling one adjacent to it produces a local tear
+    rather than a retraction.
+
+    A previous version ranked nodes by distance from the centroid and took the
+    nearest half. On a coarse mesh that still admitted edge nodes, because
+    "half the nodes" of a 5x5 grid reaches the boundary. Defining interior by
+    geometry rather than by rank is resolution-independent.
 
     Returns (grasp_xyz, node_index).
     """
-    centroid = pos.mean(axis=0)
-    d = np.linalg.norm(pos[:, :2] - centroid[:2], axis=1)
-    interior = np.argsort(d)[: max(1, len(pos) // 2)]
-    node = int(rng.choice(interior))
+    lo, hi = pos[:, :2].min(axis=0), pos[:, :2].max(axis=0)
+    span = hi - lo
+    inner_lo, inner_hi = lo + margin * span, hi - margin * span
+    inside = np.where(
+        (pos[:, 0] > inner_lo[0]) & (pos[:, 0] < inner_hi[0]) &
+        (pos[:, 1] > inner_lo[1]) & (pos[:, 1] < inner_hi[1])
+    )[0]
+    if inside.size == 0:                      # degenerate mesh: fall back to
+        inside = np.array([                   # the node nearest the centroid
+            int(np.argmin(np.linalg.norm(pos[:, :2] - pos[:, :2].mean(0), axis=1)))])
+    node = int(rng.choice(inside))
     return pos[node].astype(np.float32), node
 
 
-def select_grasp_nodes(pos: np.ndarray, jaw_xyz: np.ndarray):
+def select_grasp_nodes(pos: np.ndarray, jaw_xyz: np.ndarray, exclude=None):
     """Node indices to anchor: everything within GRASP_RADIUS of the jaw, with a
-    nearest-N fallback so a grasp can never silently catch nothing."""
+    nearest-N fallback so a grasp can never silently catch nothing.
+
+    `exclude` removes nodes that are already pinned to the world. Grasping one
+    would create two competing constraints on the same node, which the solver
+    resolves by fighting itself.
+    """
     d = np.linalg.norm(pos - jaw_xyz, axis=1)
-    ids = np.where(d < GRASP_RADIUS)[0]
+    ok = np.ones(len(pos), bool)
+    if exclude is not None and len(exclude):
+        ok[np.asarray(exclude, int)] = False
+
+    ids = np.where((d < GRASP_RADIUS) & ok)[0]
     if len(ids) < MIN_GRASP_NODES:
-        ids = np.argsort(d)[:min(MIN_GRASP_NODES, len(pos))]
+        order = np.argsort(d)
+        order = order[ok[order]]
+        ids = order[:min(MIN_GRASP_NODES, len(order))]
     return ids.astype(np.int32)
 
 
@@ -295,12 +351,13 @@ def gripper_target(phase, phase_t, grasp_pt, retract_dir):
                             LIFT_HEIGHT], np.float32)
 
 
-def run_episode(index, out_dir, record_every, seed, video=False,
-                video_size=(480, 360), verbose=False) -> str:
+def run_episode(index, out_dir, record_every, seed, mesh_path=DEFAULT_MESH,
+                video=False, video_size=(480, 360), verbose=False):
     cid = p.connect(p.DIRECT)  # headless: no window, no GPU, maximum speed
     writer = None
     try:
-        gripper, sheet, faces, stiffness, damping, settled = build_scene(seed)
+        (gripper, sheet, faces, stiffness, damping,
+         settled, boundary) = build_scene(seed, mesh_path)
         rng = np.random.default_rng(seed)
 
         grasp_pt, grasp_node = choose_grasp_point(settled, rng)
@@ -309,14 +366,19 @@ def run_episode(index, out_dir, record_every, seed, video=False,
 
         if verbose:
             lo, hi = settled.min(0), settled.max(0)
-            print(f"  settled sheet: {len(settled)} nodes, "
-                  f"x[{lo[0]:+.3f},{hi[0]:+.3f}] "
+            print(f"  mesh: {os.path.basename(mesh_path)}, {len(settled)} nodes, "
+                  f"{len(faces)} faces, {len(boundary)} pinned to world")
+            print(f"  extent: x[{lo[0]:+.3f},{hi[0]:+.3f}] "
                   f"y[{lo[1]:+.3f},{hi[1]:+.3f}] "
-                  f"z[{lo[2]:+.3f},{hi[2]:+.3f}] (m)")
+                  f"z[{lo[2]:+.3f},{hi[2]:+.3f}] (m), "
+                  f"sag {(hi[2]-lo[2])*1000:.1f} mm")
             print(f"  grasp node {grasp_node} at {grasp_pt.round(4).tolist()}, "
                   f"retract dir {retract_dir.round(2).tolist()}")
 
         anchors, grasped_ids = [], np.zeros(0, np.int32)
+        n_grasped = 0               # captured at grasp time -- grasped_ids is
+                                    # cleared on release, so reading it at the
+                                    # end of the episode always gives 0
         grasp_done = False          # so the grasp block runs exactly once
         prev_pos = settled.copy()
         prev_ee = gripper_target("approach", 0.0, grasp_pt, retract_dir)
@@ -354,7 +416,8 @@ def run_episode(index, out_dir, record_every, seed, video=False,
                                             # without this the block retries
                                             # every step of the phase
                         grasped_ids = select_grasp_nodes(
-                            node_positions(sheet), target)
+                            node_positions(sheet), target, exclude=boundary)
+                        n_grasped = len(grasped_ids)
                         # createSoftBodyAnchor welds a soft-body node to a rigid
                         # body. This is how PyBullet fakes grasping: its contact
                         # model cannot hold a deformable by friction alone.
@@ -362,7 +425,7 @@ def run_episode(index, out_dir, record_every, seed, video=False,
                             anchors.append(
                                 p.createSoftBodyAnchor(sheet, int(nid), gripper, -1))
                         if verbose:
-                            print(f"  grasped {len(grasped_ids)} node(s)")
+                            print(f"  grasped {n_grasped} node(s)")
                     if phase == "release" and anchors:
                         for a in anchors:
                             p.removeConstraint(a)
@@ -398,10 +461,14 @@ def run_episode(index, out_dir, record_every, seed, video=False,
                     if writer is not None:
                         writer.append_data(grab_frame(*video_size, view, proj))
 
-        # One summary line per episode beats a warning per timestep.
-        final = node_positions(sheet)
-        moved = np.linalg.norm(final - settled, axis=1).max() * 1000
-        return path, len(grasped_ids), moved
+        # Peak deformation over the whole episode, not just the final frame:
+        # the sheet recoils after release, so the end state understates it.
+        # Boundary nodes are excluded because they are pinned and never move.
+        interior = np.setdiff1d(np.arange(len(settled)), boundary)
+        traj_pos = np.load(path)["tissue_pos"]
+        moved = np.linalg.norm(
+            traj_pos[:, interior] - settled[interior], axis=2).max() * 1000
+        return path, n_grasped, moved
     finally:
         # `finally` guarantees these are released even if the episode raises.
         # Leaked physics servers eventually exhaust PyBullet's slots, and an
@@ -412,6 +479,11 @@ def run_episode(index, out_dir, record_every, seed, video=False,
 
 
 def main():
+    # Must be declared before DT is read anywhere in this function -- Python
+    # requires `global` to precede every use of the name in the scope, and the
+    # --dt help text below reads it.
+    global DT
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--out", default="/work/data")
@@ -420,6 +492,13 @@ def main():
                          "Logging every step makes huge files with almost no "
                          "extra information.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mesh", default=DEFAULT_MESH,
+                    help="tissue mesh .obj (generate with make_tissue_mesh.py)")
+    ap.add_argument("--dt", type=float, default=None,
+                    help=f"physics timestep in seconds (default {DT:.6f} = "
+                         f"1/{1/DT:.0f}). Smaller is more stable and slower. "
+                         "Establish the right value with timestep_study.py "
+                         "rather than guessing.")
     ap.add_argument("--video", action="store_true",
                     help="also write an .mp4 per episode. Rendering uses a CPU "
                          "software rasteriser and roughly triples runtime, so "
@@ -428,6 +507,18 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the per-episode geometry report")
     args = ap.parse_args()
+
+    if args.dt is not None:
+        # Rebind the module-level constant. Every function reads DT from module
+        # globals at call time, so this takes effect everywhere. Keeping one
+        # source of truth beats threading a dt argument through six functions.
+        DT = float(args.dt)
+        print(f"timestep overridden: dt = {DT:.6f} s (1/{1/DT:.0f})")
+
+    if not os.path.isfile(args.mesh):
+        raise SystemExit(
+            f"Tissue mesh not found: {args.mesh}\nGenerate it first:\n"
+            "  docker compose run --rm surrol python container/make_tissue_mesh.py")
 
     os.makedirs(args.out, exist_ok=True)
     total = sum(d for _, d in PHASES)
@@ -443,7 +534,7 @@ def main():
         # Report geometry on the first episode only: enough to confirm the
         # scene is sane, not enough to drown the log.
         path, n_grasped, moved_mm = run_episode(
-            i, args.out, args.record_every, args.seed + i,
+            i, args.out, args.record_every, args.seed + i, mesh_path=args.mesh,
             video=args.video, verbose=(i == 0 and not args.quiet))
         dt_wall = time.time() - t0
         flag = ""

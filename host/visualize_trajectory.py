@@ -61,15 +61,33 @@ def diagnose(traj) -> dict:
     pos = traj.tissue_pos.astype(np.float64)
     disp = np.linalg.norm(pos - pos[0], axis=2)       # (T,N) distance from start
     speed = np.linalg.norm(traj.tissue_vel.astype(np.float64), axis=2)
+    grasp = traj.grasp_active.astype(bool)
+
+    peak_step = int(np.argmax(speed.max(axis=1)))
+    # Release = the step where the grasp flag goes True -> False. Genuine
+    # elastic recoil lives there; fast motion anywhere else is suspicious.
+    rel = np.flatnonzero(np.diff(grasp.astype(int)) < 0)
+    release_step = int(rel[0]) + 1 if rel.size else -1
+
+    # Gripper speed, so tissue speed can be judged against something. Tissue
+    # moving far faster than the thing pulling it has to be explained.
+    ee = traj.ee_pose[:, :3].astype(np.float64)
+    ee_speed = np.linalg.norm(np.diff(ee, axis=0), axis=1) / float(traj.dt) \
+        if len(traj) > 1 else np.zeros(1)
+
     return {
         "max_disp": disp.max(axis=1),                 # (T,)
         "max_speed": speed.max(axis=1),               # (T,)
         "ee_z": traj.ee_pose[:, 2].astype(np.float64),
-        "grasp": traj.grasp_active.astype(bool),
+        "grasp": grasp,
         "peak_disp_mm": disp.max() * 1000,
         "peak_speed": speed.max(),
-        "n_grasped": int(traj.grasp_ids(int(np.argmax(traj.grasp_active))).size)
-        if traj.grasp_active.any() else 0,
+        "peak_step": peak_step,
+        "release_step": release_step,
+        "near_release": release_step >= 0 and abs(peak_step - release_step) <= 3,
+        "ee_peak_speed": float(ee_speed.max()),
+        "n_grasped": int(traj.grasp_ids(int(np.argmax(grasp))).size)
+        if grasp.any() else 0,
     }
 
 
@@ -77,16 +95,33 @@ def report(traj, d: dict) -> None:
     print(traj)
     print(f"  notes         : {traj.notes}")
     print(f"  peak displacement : {d['peak_disp_mm']:.1f} mm")
-    print(f"  peak node speed   : {d['peak_speed']:.3f} m/s")
+    print(f"  peak node speed   : {d['peak_speed']:.3f} m/s "
+          f"at step {d['peak_step']}/{len(traj)-1}")
+    print(f"  gripper max speed : {d['ee_peak_speed']:.3f} m/s "
+          f"({d['peak_speed']/max(d['ee_peak_speed'],1e-9):.0f}x slower than tissue)"
+          if d["ee_peak_speed"] > 0 else "")
+    print(f"  release at step   : {d['release_step']}")
     print(f"  grasped nodes     : {d['n_grasped']}")
     print(f"  grasp active for  : {d['grasp'].sum()}/{len(traj)} steps")
 
     # Loud, specific warnings beat a pretty plot you have to interpret.
-    if d["peak_speed"] > UNSTABLE_SPEED:
-        print(f"\n  WARNING: peak speed {d['peak_speed']:.2f} m/s exceeds "
-              f"{UNSTABLE_SPEED} m/s. The solver almost certainly diverged.\n"
-              "  Reduce DT, reduce springElasticStiffness, or raise damping in\n"
-              "  container/collect_retraction.py. Do not train on this episode.")
+    if d["peak_speed"] > UNSTABLE_SPEED or d["peak_speed"] > 10 * d["ee_peak_speed"]:
+        if d["near_release"]:
+            print(f"\n  NOTE: peak speed {d['peak_speed']:.2f} m/s occurs AT THE "
+                  "RELEASE (step "
+                  f"{d['release_step']}).\n"
+                  "  That is where elastic recoil lives, so this may well be real\n"
+                  "  physics rather than instability. The two look identical in a\n"
+                  "  single run -- confirm with a convergence study:\n"
+                  "    docker compose run --rm surrol python container/timestep_study.py\n"
+                  "  Recoil converges as the timestep shrinks; divergence does not.")
+        else:
+            print(f"\n  WARNING: peak speed {d['peak_speed']:.2f} m/s occurs at step "
+                  f"{d['peak_step']}, away from the release.\n"
+                  "  Fast motion that is not recoil is a divergence signature. Run\n"
+                  "    docker compose run --rm surrol python container/timestep_study.py\n"
+                  "  to find a timestep where the answer stops changing. Do not\n"
+                  "  train on this episode until it does.")
     if d["n_grasped"] == 0 and d["grasp"].any():
         print("\n  WARNING: grasp phase ran but caught 0 nodes -- the gripper "
               "never reached the sheet.\n  Increase GRASP_RADIUS or lower "
