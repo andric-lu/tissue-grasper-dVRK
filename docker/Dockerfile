@@ -101,10 +101,37 @@ RUN pip install "roboticstoolbox-python" && pip install "numpy==1.23.5"
 # -----------------------------------------------------------------------------
 # SurRoL
 # -----------------------------------------------------------------------------
+# --branch main IS REQUIRED and is easy to get wrong.
+#
+# This repository's DEFAULT branch is `SR-VPPV`, not `main`. A plain
+# `git clone` gets SR-VPPV, which is the Science Robotics'25 paper release: it
+# is organised as research artifacts (VPPV/, Benchmark/, Haptic_guidance/) with
+# no setup.py at the root, so `pip install -e .` fails with
+# "does not appear to be a Python project".
+#
+# `main` is the IROS'21 SurRoL: an installable package with the dVRK robots,
+# the gym-style API, and the ten surgical tasks. That is what we want.
+#
+# Other branches, for later:
+#   Dev        -- the Taichi MPM soft-body work (arXiv:2402.01181). This is the
+#                 physically meaningful tissue model you will move to in Phase 1.
+#   SurRoL-v2  -- RA-L'23, human-in-the-loop interactive simulation
+#   SR-VPPV    -- Science Robotics'25, full surgical autonomy framework
+#
+# The general lesson: on research repositories, always check which branch you
+# actually cloned. Default branches drift as labs publish new papers, and the
+# branch you read about in a paper is often not the default today.
+#
 # --depth 1 clones only the latest commit instead of the full history: faster,
 # smaller, and you do not need SurRoL's history.
 WORKDIR /opt
-RUN git clone --depth 1 https://github.com/med-air/SurRoL.git
+RUN git clone --depth 1 --branch main https://github.com/med-air/SurRoL.git
+
+# Fail loudly and immediately if the layout is not what we expect, rather than
+# letting a confusing error surface three instructions later.
+RUN test -f /opt/SurRoL/setup.py \
+    || (echo "ERROR: /opt/SurRoL/setup.py missing -- wrong branch cloned?" \
+        && ls -la /opt/SurRoL && exit 1)
 
 WORKDIR /opt/SurRoL
 # `-e` = editable install: Python is pointed at /opt/SurRoL rather than copying

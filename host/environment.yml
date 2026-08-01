@@ -18,27 +18,46 @@ channels:
   # explicitly means this file behaves the same on any machine.
   - conda-forge
 
+# -----------------------------------------------------------------------------
+# ONE RULE IN THIS FILE: every package containing compiled code comes from pip,
+# not from conda.
+#
+# Why. Numerical libraries bundle a threading runtime called OpenMP
+# (`libomp.dylib`). conda-forge's numpy/scipy link against conda's copy; the
+# PyPI torch wheel ships its own copy inside torch/.dylibs/. Load both into one
+# Python process and it aborts with:
+#
+#     OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib
+#     already initialized.
+#
+# Mixing conda and pip for compiled packages is the usual cause. The reliable
+# fix is a single source, and PyPI is the better choice here because torch's
+# MPS backend and taichi's Metal backend are both best-supported there.
+#
+# So: conda provides the Python interpreter and pure-Python tooling. pip
+# provides the entire numerical stack. If you add a package later that has
+# compiled internals, add it to the pip: block.
+# -----------------------------------------------------------------------------
+
 dependencies:
   # Python 3.11: comfortably inside Taichi 1.7.4's supported range (3.9-3.13),
   # fully supported by PyTorch, and mature enough that every package you want
   # has a prebuilt ARM64 wheel. 3.13 would work but you would be first in line
   # for packaging bugs, which is not where you want to be while learning.
   - python=3.11
-
-  # Install from conda where a compiled library is involved -- conda ships
-  # binaries built to work together, which avoids a class of "works on my
-  # machine" linker problems.
-  - numpy
-  - scipy
-  - matplotlib
-  - pandas
-  - jupyterlab      # notebooks are the right tool for inspecting trajectories
-  - pip             # so the pip: block below can run
+  - pip
 
   - pip:
-    # PyTorch is installed via pip. On Apple Silicon the standard PyPI wheel
-    # already includes the MPS (Metal Performance Shaders) backend -- there is
-    # no separate "GPU version" to hunt down, unlike CUDA on Linux.
+    # The numerical stack, all from one source so there is exactly one OpenMP
+    # runtime in the process.
+    - numpy
+    - scipy
+    - pandas
+    - matplotlib
+
+    # On Apple Silicon the standard PyPI torch wheel already includes the MPS
+    # (Metal Performance Shaders) backend -- there is no separate "GPU version"
+    # to hunt down, unlike CUDA on Linux.
     - torch
     - torchvision
 
@@ -46,6 +65,9 @@ dependencies:
     # the M3 Max GPU. There is no ARM Linux build of Taichi at all, so this
     # package is a concrete reason the host side has to exist.
     - taichi==1.7.4
+
+    # Notebooks are the right tool for inspecting trajectories.
+    - jupyterlab
 
     # Reading trajectories and rendering meshes for inspection.
     - trimesh

@@ -141,7 +141,12 @@ def _():
 def _():
     import os
     import surrol
-    root = os.path.dirname(surrol.__file__)
+    # Use __path__, not __file__. SurRoL ships no surrol/__init__.py, so Python
+    # treats it as a "namespace package", and namespace packages have
+    # __file__ = None -- os.path.dirname(None) raises TypeError. __path__ is a
+    # list of directories and is populated for both regular and namespace
+    # packages, so it is the portable way to ask "where does this package live".
+    root = list(surrol.__path__)[0]
     assets = os.path.join(root, "assets")
     if not os.path.isdir(assets):
         return "WARN", f"surrol imported from {root} but no assets/ directory found"
