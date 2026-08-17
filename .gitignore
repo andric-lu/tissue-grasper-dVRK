@@ -7,6 +7,9 @@
 # somewhere designed for large files, not in git.
 data/*.npz
 data/**/*.npz
+# data_synth/ is regenerable in seconds from src/synthetic_traj.py, so the
+# SCRIPT is the artifact worth versioning, not its output.
+data_synth/*.npz
 models/*.pt
 runs/
 *.mp4
@@ -32,3 +35,7 @@ env/
 .vscode/
 .idea/
 *.swp
+
+# --- Claude Code -------------------------------------------------------------
+# Per-machine tool permissions, not project configuration.
+.claude/settings.local.json
