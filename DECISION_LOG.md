@@ -4,6 +4,8 @@
 1. 1 August 2026 · Environment setup and first working data pipeline (§1–§7)
 2. 13–16 August 2026 · Schema v2, metrics, and the testable-before-the-simulator
    layer (§8) — *reconstructed from source on 17 August, see the note there*
+3. 17 August 2026 · Documentation recovered into git, boundary_mask bug, MPM
+   route settled (§9)
 
 **Objective:** A dynamics model that predicts soft tissue response during
 deformation and external disturbance, starting with basic tissue retraction.
@@ -264,11 +266,12 @@ dangerous because nothing warns you.
 **`container/validate_physics.py`** — nine experiments whose correct answer is
 known in advance: rest stability, boundary held, grasp held, 4-fold rotational
 symmetry, mirror symmetry, Saint-Venant decay, stiffness monotonicity,
-determinism, mesh convergence. **Never run — see §9.**
+determinism, mesh convergence. **Never run — see §10.**
 
 **`host/validate_dataset.py`** — data-integrity checks on recorded data. Reads
 only the shared format, so it applies unchanged to Taichi/MPM and Isaac Sim
-later. Eight checks as of session 1; thirteen as of session 2 (§8.5).
+later. Eight checks as of session 1; thirteen as of session 2 (§8.5);
+fourteen as of session 3 (§9.2).
 
 **The symmetry test is the strongest single check.** Grasp the centre node of an
 odd-resolution mesh, pull straight up: geometry, boundary condition and load are
@@ -610,7 +613,7 @@ Recorded so this is not mistaken for more progress than it was.
 - **No MPM simulator.** Nothing yet writes a real `F`. `synthetic_traj.py` is
   scaffolding, explicitly not a simulator.
 - **No new physics data.** `data/` is unchanged since 1 August.
-- **`validate_physics.py` was never run** — see §9.
+- **`validate_physics.py` was never run** — see §10.
 - **The v1 dataset is thin.** Across sampled episodes, peak displacement spans
   26.5–29.4 mm — a 4% spread, with no material randomisation at all. The
   diversity check passes, but 20 near-identical retractions is not much signal.
@@ -634,7 +637,152 @@ clean last run (`lastfailed: {}`, 200 collected), but that is a stale record, no
 a verification. Run `pytest tests/ -v` to confirm.
 
 ---
-## 9. Files
+
+## 9. Session 3 — 17 August 2026: recovery, one real bug, and the MPM route
+
+Written the same day as the work, which §8 is the argument for.
+
+### 9.1 The reasoning was not under version control
+
+`DECISION_LOG.md` and `SESSION_TRANSCRIPT.md` existed only in the claude.ai
+project. Never in git, never diffable against a commit, invisible to anyone
+cloning the repository — the two documents carrying every "why" in the project
+lived outside it. `container/validate_physics.py` was in the same position: cited
+in §5 for sixteen days, never written to disk.
+
+Also found: four days of work (13–16 August, all of §8) had never been committed.
+Roughly 120 KB across seven new files with no git history behind it.
+
+All now committed, in four commits. The near-loss is the point — **the work most
+worth keeping was the work least protected**, because writing code feels like
+progress and committing it does not.
+
+### 9.2 `boundary_mask` was wrong in three of four synthetic episodes
+
+The first bug found *by* the v2 validation layer, and it was found by asking a
+question the layer could not answer.
+
+All four kinds in `synthetic_traj.py` shipped the same 22-particle clamp mask,
+because `_clamped_edge()` was applied unconditionally. Only two honour it:
+
+```
+episode     clamped   max disp CLAMPED
+rest             22          0.000 mm    consistent
+uniaxial         22         12.868 mm    *** file lied ***
+rotation         22         60.000 mm    *** file lied ***
+retract          22          0.000 mm    consistent
+```
+
+**The deformations were right; the metadata was wrong.** `rotation` *must* move
+every particle — clamp one and it stops being rigid, which destroys the exact
+property that episode exists to demonstrate. Same for `uniaxial`: a clamped edge
+makes the stretch non-uniform and `J = 1` exactly stops holding. So the fix was
+never to change the physics, it was to stop the file asserting a constraint the
+motion does not honour.
+
+The other three now carry an **all-False** mask, not an empty one. Empty means
+"this simulator did not record it"; all-False means "recorded, nothing clamped."
+We know the answer, so claiming ignorance would be its own small lie — the same
+distinction §8.1 draws for every other v2 field.
+
+**Nothing caught this because no check read `boundary_mask`.** Thirteen checks,
+none touching the field. Now fourteen:
+
+> **`check_boundary_is_held`** — particles marked kinematically clamped do not
+> move. SKIPs when no mask is recorded.
+
+This is the §3.5 failure — anchors silently not holding — made detectable **from
+the file alone**. In August that was found by noticing peak displacement equalled
+the gripper's own travel, which required knowing the gripper's travel and
+thinking to compare. The check asserts the property directly.
+
+`collect_retraction.py` now writes the mask it already computes in
+`build_scene`, and writes what was *actually* anchored rather than what the
+geometry identifies — with `ANCHOR_BOUNDARY` off the mask is all-False, a real
+reading rather than a statement of intent. The 20 episodes in `data/` predate
+this and record no mask; the check SKIPs on them.
+
+**Verified against the broken files, not just the fixed ones:** the old
+`rotation.npz` and `uniaxial.npz` FAIL with the exact displacements above, while
+the corrected set passes 46/46. A check only demonstrated on good data has not
+been demonstrated.
+
+*Generalises to:* a schema field with no check on it is a field that will drift.
+The empty-vs-zero doctrine of §8.1 protects the *reader* from a fabricated
+default; it does nothing about a *writer* that fabricates a real-looking value.
+
+### 9.3 The MPM route: Taichi decides it, and it decides it on architecture
+
+Investigated whether SurRoL's own MPM makes further simulator work unnecessary.
+It largely does — but the branch matters, and so does where it can run.
+
+**Two different MPMs in that repository:**
+
+- `SR-VPPV/Data_driven_scene_simulation` — [arXiv:2405.00956](https://arxiv.org/abs/2405.00956),
+  physics-embedded 3D Gaussians reconstructed **from stereo endoscopic video**.
+  MPM in service of visual realism. Wrong tool here: there is no video, and the
+  deformation is fitted to look right rather than to a constitutive law with
+  parameters you set.
+- **`Dev`** — [arXiv:2402.01181](https://arxiv.org/abs/2402.01181), Taichi MPM,
+  Neo-Hookean, dVRK-compatible. This is the destination, as §2.3 already said.
+
+**The blocker is architectural and absolute: Taichi has no Linux ARM64 wheel.**
+Not in the pinned 1.6.0, not in current 1.7.4. Wheels cover Windows x86-64,
+Linux x86-64, macOS arm64 — and nothing for Linux ARM. `panda3d==1.10.11` ships
+aarch64 wheels and `pymeshlab` covers Linux ARM64; Taichi is the sole holdout.
+
+So the MPM **cannot run in the container**, at all, without building Taichi from
+source against LLVM for aarch64. It runs on the host, where the macOS arm64 wheel
+already sits in `environment.yml`.
+
+§1.2 chose host+container to keep Metal reachable, expecting a speed argument.
+The real consequence is stronger: **the host is not where Taichi runs best, it is
+the only place it runs.** This was already recorded in a comment in
+`host/environment.yml` on 16 August — "There is no ARM Linux build of Taichi at
+all" — and was still rediscovered from PyPI a day later, because a code comment
+is not where anyone looks for a platform decision. That is this section's second
+argument for itself.
+
+**`MPM/` lifts cleanly.** Four files — `config.py`, `mpm3d.py`, `sdf.py`,
+`requirements.txt` — importing `taichi`, `pybullet`, `skimage`, `numpy`. No
+`surrol.*`, no `panda3d`. Notable:
+
+- Backend selection already prefers Metal, then Vulkan, then CUDA, then CPU.
+- **Dense grids only** — no `pointer`/`bitmasked` SNodes, which is the family of
+  Taichi feature Metal does not support. The main portability risk is absent.
+- Per-particle fields `F_x`, `F_v`, `F_C`, `F` (deformation gradient), `FJ` map
+  almost one-to-one onto the v2 schema.
+- Neo-Hookean: `stress = mu*(F@Fᵀ − I) + I*la*log(J)`, with μ/λ from
+  `set_parameters()`. `materials.py` is not approximately right for this
+  interface, it is exactly right — and §8.3's ν → 0.5 warning finally has a
+  concrete consumer.
+- API is `init()` / `step()` / `reset()` / `get_mesh()` / `substep()`. PyBullet
+  supplies rigid-body collision via an SDF, which is the seam the PSM plugs into
+  later.
+
+**Decision: vendor it** at `third_party/MPM/`, recording the upstream commit SHA.
+Not a submodule — these four files will be edited to expose particle state and to
+script the tool, and a submodule you cannot edit is friction without benefit. The
+SHA is what makes the fork honest.
+
+**Open, to be settled by a smoke test rather than argument:**
+
+1. `ti._lib.core.with_metal()` is a **private** Taichi API and their code pins
+   1.6.0 while the host has 1.7.4. If that path moved, the guard fails silently
+   and everything runs on `ti.cpu` — correct physics, wrong speed, no error.
+   Print the selected backend and confirm it.
+2. `pybullet` and `scikit-image` are not yet in the host environment. PyBullet
+   has no macOS arm64 wheel and compiles from source, 5–8 minutes with no
+   output. Not a hang (§2.2 documents the same for the container).
+3. `from MPM.config import ...` means the directory must be importable *as*
+   `MPM`, so its parent has to be on `sys.path`.
+
+**Still not done:** nothing writes MPM state to `.npz`. That adapter — read
+particle state, write a v2 trajectory — is the next piece of code, and it is
+small precisely because §8 built its receiving end first.
+
+---
+## 10. Files
 
 Every path below was checked against the repository on 17 August 2026.
 
@@ -670,7 +818,7 @@ copy is the shareable view, not the only copy.
 | `host/verify_host.py` | macOS | GPU reachability checks | |
 | `host/train_dynamics.py` | macOS | MLP baseline on MPS | |
 | `host/visualize_trajectory.py` | macOS | 3D animation + stability diagnostics | |
-| `host/validate_dataset.py` | macOS | 13 data-integrity checks | §8.5 |
+| `host/validate_dataset.py` | macOS | 14 data-integrity checks | §8.5, §9.2 |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |
@@ -689,7 +837,7 @@ copy is the shareable view, not the only copy.
 
 ---
 
-## 10. References
+## 11. References
 
 - Xu et al., *SurRoL*, IROS 2021 — [arXiv:2108.13035](https://arxiv.org/abs/2108.13035)
 - *Efficient Physically-based Simulation of Soft Bodies in Embodied Environment for Surgical Robot* — [arXiv:2402.01181](https://arxiv.org/abs/2402.01181)

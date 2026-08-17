@@ -397,8 +397,28 @@ def run_episode(index, out_dir, record_every, seed, mesh_path=DEFAULT_MESH,
                 os.path.join(out_dir, f"retraction_{index:04d}.mp4"),
                 fps=max(1, int(1 / (DT * record_every))))
 
+        # Record WHICH NODES ARE PINNED, not merely that pinning happened.
+        #
+        # `boundary` is an index array this function already has; the schema
+        # wants a per-node boolean. Recovering it downstream means reapplying
+        # the geometric edge rule and hoping it selects the same nodes -- true
+        # for a rectangular sheet, false the moment the tissue is any other
+        # shape. An assumption the reader has to make is worse than a fact the
+        # file states, and stating it costs three lines.
+        #
+        # The mask describes what was ACTUALLY anchored, not what the geometry
+        # identifies. With ANCHOR_BOUNDARY off nothing is clamped, and the file
+        # should say so -- an all-False mask is a real reading, not a
+        # description of intent. validate_dataset's check_boundary_is_held then
+        # verifies the anchors held, which makes the §3.5 failure detectable
+        # from the file alone instead of by noticing a suspicious number.
+        boundary_mask = np.zeros(len(settled), bool)
+        if ANCHOR_BOUNDARY:
+            boundary_mask[boundary] = True
+
         with TrajectoryWriter(path, simulator="pybullet", task="tissue_retraction",
                               dt=DT * record_every, tissue_faces=faces,
+                              boundary_mask=boundary_mask,
                               notes=notes) as w:
             step = 0
             for phase, duration in PHASES:

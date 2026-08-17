@@ -74,6 +74,34 @@ from trajectory_io import (
 
 KINDS = ("rest", "uniaxial", "rotation", "retract")
 
+# WHICH KINDS ACTUALLY CLAMP ANYTHING.
+#
+# Only `retract` holds particles fixed. That is not an oversight in the other
+# three, it is forced by what each one is for:
+#
+#   rotation  is a RIGID rotation. Clamp any particle and it stops being rigid
+#             -- you introduce real strain, and this episode's entire purpose is
+#             to carry large motion with ZERO strain.
+#   uniaxial  is a UNIFORM stretch. Clamp an edge and the stretch is no longer
+#             uniform, F stops equalling the analytic value, and J = 1 exactly
+#             stops holding.
+#   rest      applies the identity map, which constrains nothing. Its particles
+#             do not move because the map does not move them, not because
+#             anything holds them. Nothing here solves an equation of motion, so
+#             there is no gravity for a clamp to resist.
+#
+# The other three therefore get an ALL-FALSE mask, not an empty one. Empty means
+# "this simulator did not record it"; all-False means "recorded, and nothing is
+# clamped". We know the answer, so claiming ignorance would be its own small
+# lie -- the same distinction trajectory_io draws for every other v2 field.
+#
+# Fixed on 17 Aug: all four kinds previously shipped the same 22-particle mask,
+# so rotation.npz asserted 22 clamped particles while moving them 60 mm. The
+# deformations were right; the metadata was wrong. Nothing caught it because no
+# check in validate_dataset read boundary_mask -- check_boundary_is_held now
+# does.
+_CLAMPS = {"rest": False, "uniaxial": False, "rotation": False, "retract": True}
+
 # Model step, per §2.6. Fixed: a variable-dt model is a different and harder
 # model, and nothing is served by making the first dataset heterogeneous in it.
 DT = 0.010
@@ -209,7 +237,10 @@ def make_synthetic_episode(path: str, kind: str, *, n_particles: int = 500,
     rng = np.random.default_rng(seed)
     X = _sheet(n_particles)
     N = len(X)
-    boundary = _clamped_edge(X)
+    # Only the kinds whose deformation map actually holds particles still --
+    # see _CLAMPS. The mask must describe what the motion does, not what a
+    # sheet-shaped thing usually has.
+    boundary = _clamped_edge(X) if _CLAMPS[kind] else np.zeros(N, bool)
 
     material = sample_material(rng)
     mu, _, rho = unpack_material(material)
