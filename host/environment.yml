@@ -72,3 +72,10 @@ dependencies:
     # Reading trajectories and rendering meshes for inspection.
     - trimesh
     - tqdm
+
+    # The test suite under tests/. Kept here rather than in a separate dev
+    # environment: the metric and rotation tests encode physics that must hold
+    # (a pure rotation is not strain, det(F) > 0), so they are part of the
+    # working setup rather than an optional extra.
+    #   pytest tests/ -v
+    - pytest
