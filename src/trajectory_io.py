@@ -22,6 +22,14 @@ everywhere and there is nothing extra to install. If episodes later get large
 enough that you need partial/streaming reads, swap the two functions at the bottom
 for h5py equivalents -- nothing else in your codebase should have to change.
 
+WHEN TO ACTUALLY MAKE THAT SWAP: `tissue_F` is the trigger. It is nine floats per
+particle per step, which dwarfs everything else in the file. At MPM scale --
+10,000 particles x 400 steps x 9 floats x 4 bytes -- that is ~144 MB per episode
+for the deformation gradient alone, before compression and before the other
+fields. A thousand-episode dataset is then measured in hundreds of gigabytes and
+must be read lazily. `store_F_as_float16=True` halves it as a stopgap; when
+halving is no longer enough, move to h5py.
+
 THE SCHEMA
 ----------
 Static (recorded once per episode):
@@ -32,8 +40,22 @@ Static (recorded once per episode):
     tissue_faces     (F,3) int32   surface triangle topology, or empty
     tissue_tets      (E,4) int32   tetrahedral topology, or empty
     notes            str    free text: mesh resolution, material params, seed...
+  -- added in v2 --
+    material_params  (3,) float32  [log(mu), log(lambda), rho]. Logs, not Pascals:
+                                   tissue stiffness spans orders of magnitude and
+                                   a network fed raw Pascals burns capacity on the
+                                   exponent. Empty (0,) if the simulator has no
+                                   constitutive model (PyBullet mass-spring).
+    substep_dt       float32       solver substep, seconds. 0.0 = not recorded.
+    n_substeps       int32         substeps per recorded step. 0 = not recorded.
+    boundary_mask    (N,) bool     True where a particle is kinematically clamped.
+                                   Empty (0,) if unknown.
+    action_spec      str           "abs_pose_jaw" | "delta_pose_jaw" | "unknown"
+    target_origin    (3,) float32  centre of the target region to expose
+    target_normal    (3,) float32  unit normal of the target plane
+    target_extent    (2,) float32  half-extents of the target rectangle, metres
 
-Per-step (T = number of steps, N = number of tissue nodes):
+Per-step (T = number of steps, N = number of tissue nodes/particles):
     tissue_pos       (T,N,3) float32   node positions, metres, world frame
     tissue_vel       (T,N,3) float32   node velocities, m/s (zeros if unavailable)
     ee_pose          (T,7)   float32   end-effector [x,y,z,qx,qy,qz,qw]
@@ -43,10 +65,29 @@ Per-step (T = number of steps, N = number of tissue nodes):
     action           (T,A)   float32   the command issued at this step
     grasp_active     (T,)    bool      was the gripper holding tissue
     contact_force    (T,3)   float32   net force on the end-effector, newtons
+  -- added in v2 --
+    tissue_F         (T,N,3,3) float32 deformation gradient. Empty (0,) when the
+                                       solver has none: a mass-spring cloth has no
+                                       F, and writing identity there would be a
+                                       fabricated measurement, not a default.
+    contact_mode     (T,) int8         CONTACT_* enum below
+    exposure         (T,) float32      logged success metric, see tissue_metrics
+    safety_strain    (T,) float32      logged safety metric, see tissue_metrics
 
 Grasped node indices vary in length per step, so they are stored CSR-style:
     grasp_ids_flat    (sum_of_lengths,) int32
     grasp_ids_offset  (T+1,) int32      step t's ids = flat[offset[t]:offset[t+1]]
+
+READING v1 FILES
+----------------
+v1 files load without error. Fields introduced in v2 come back as EMPTY arrays,
+never as zeros. That distinction is deliberate: 0.0 is a legitimate value for
+`exposure` (fully occluded) and for `safety_strain`, and all-False is a
+legitimate value for `boundary_mask`, so a zero default is indistinguishable from
+a real measurement. `arr.size == 0` means "this simulator did not record it" and
+callers can branch on it honestly. The two scalars `substep_dt`/`n_substeps` are
+the exception -- zero substeps is not a physically meaningful reading, so 0
+carries "not recorded" without ambiguity.
 
 UNITS ARE NOT OPTIONAL. Metres, seconds, kilograms, newtons, radians. Every
 simulator has different defaults; convert at the writer, never at the reader.
@@ -60,7 +101,41 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
+
+# Every version this reader knows how to turn into a v2-shaped Trajectory.
+# A file claiming anything else cannot be interpreted safely, and guessing is
+# worse than stopping: silently misreading a field is how a whole training run
+# gets thrown away a week later.
+KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0")
+
+
+# --------------------------------------------------------------------------
+# Contact mode
+# --------------------------------------------------------------------------
+# Defined here, next to the schema, because this is the ONLY place that should
+# know the integer values. A collector, a validator and a model that each carry
+# their own copy of this enum will disagree eventually, and the disagreement
+# shows up as a model that has learned the wrong contact semantics rather than
+# as an error.
+CONTACT_NONE = 0     # tool is not touching tissue
+CONTACT_TOUCH = 1    # touching, no tangential constraint
+CONTACT_STICK = 2    # touching, tangentially held by friction
+CONTACT_SLIP = 3     # touching, sliding
+CONTACT_GRASP = 4    # jaws closed, tissue kinematically attached to the tool
+
+CONTACT_MODE_NAMES = {
+    CONTACT_NONE: "none",
+    CONTACT_TOUCH: "touch",
+    CONTACT_STICK: "stick",
+    CONTACT_SLIP: "slip",
+    CONTACT_GRASP: "grasp",
+}
+
+# Legal values for the static `action_spec` field. "unknown" exists for v1 files,
+# whose 4-element [target_xyz, grasp_flag] action is neither of the two real
+# specs; calling it "abs_pose_jaw" would misdescribe its width and its contents.
+ACTION_SPECS = ("abs_pose_jaw", "delta_pose_jaw", "unknown")
 
 
 # --------------------------------------------------------------------------
@@ -90,7 +165,21 @@ class TrajectoryWriter:
         tissue_faces: Optional[np.ndarray] = None,
         tissue_tets: Optional[np.ndarray] = None,
         notes: str = "",
+        *,
+        material_params: Optional[np.ndarray] = None,
+        substep_dt: float = 0.0,
+        n_substeps: int = 0,
+        boundary_mask: Optional[np.ndarray] = None,
+        action_spec: str = "unknown",
+        target_origin: Optional[np.ndarray] = None,
+        target_normal: Optional[np.ndarray] = None,
+        target_extent: Optional[np.ndarray] = None,
+        store_F_as_float16: bool = False,
     ):
+        # Everything added in v2 is keyword-only. The four leading positional
+        # arguments are kept positional because callers already pass them that
+        # way; adding a tenth positional argument to this list would be the
+        # silent-bug factory that `append` is already keyword-only to avoid.
         self.path = path
         self.simulator = simulator
         self.task = task
@@ -100,12 +189,39 @@ class TrajectoryWriter:
         self.tissue_faces = _as(tissue_faces, np.int32, (-1, 3))
         self.tissue_tets = _as(tissue_tets, np.int32, (-1, 4))
 
+        if action_spec not in ACTION_SPECS:
+            raise ValueError(f"action_spec must be one of {ACTION_SPECS}, got {action_spec!r}")
+        self.action_spec = action_spec
+
+        # Static v2 fields. `_as(None, ...)` yields the empty array that means
+        # "not recorded" -- see the READING v1 FILES note in the module docstring.
+        self.material_params = _as(material_params, np.float32, (3,)) \
+            if material_params is not None else np.zeros(0, np.float32)
+        self.substep_dt = float(substep_dt)
+        self.n_substeps = int(n_substeps)
+        self.boundary_mask = _as(boundary_mask, bool, (-1,)) \
+            if boundary_mask is not None else np.zeros(0, bool)
+        self.target_origin = _as(target_origin, np.float32, (3,)) \
+            if target_origin is not None else np.zeros(0, np.float32)
+        self.target_normal = _as(target_normal, np.float32, (3,)) \
+            if target_normal is not None else np.zeros(0, np.float32)
+        self.target_extent = _as(target_extent, np.float32, (2,)) \
+            if target_extent is not None else np.zeros(0, np.float32)
+
+        # float16 is a STORAGE format, not a compute format: the reader upcasts
+        # it back to float32. Be aware of what it costs. Near F = I the spacing
+        # of float16 is ~1e-3, so a 0.1% stretch is not representable at all.
+        # Fine for logging large deformation, wrong for small-strain analysis.
+        self.store_F_as_float16 = bool(store_F_as_float16)
+
         # Per-step buffers.
         self._pos, self._vel = [], []
         self._ee_pose, self._ee_vel = [], []
         self._jaw, self._joint, self._action = [], [], []
         self._grasp_active, self._force = [], []
         self._grasp_ids_flat, self._grasp_offset = [], [0]
+        self._F, self._contact_mode = [], []
+        self._exposure, self._safety_strain = [], []
 
         # Shapes are locked in on the first append and enforced afterwards.
         # Catching a shape change at step 200 is far cheaper than discovering
@@ -113,6 +229,10 @@ class TrajectoryWriter:
         self._n_nodes = None
         self._n_joints = None
         self._n_action = None
+        # Optional per-step fields are all-or-nothing across an episode. Half a
+        # column of deformation gradients is worse than none: it produces an
+        # array whose length silently disagrees with tissue_pos.
+        self._optional_present = {}
 
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
 
@@ -141,9 +261,18 @@ class TrajectoryWriter:
         grasp_active: bool = False,
         grasp_node_ids: Optional[Sequence[int]] = None,
         contact_force: Optional[np.ndarray] = None,
+        tissue_F: Optional[np.ndarray] = None,
+        contact_mode: Optional[int] = None,
+        exposure: Optional[float] = None,
+        safety_strain: Optional[float] = None,
     ) -> None:
         """Record one timestep. Keyword-only on purpose: positional args here
-        would be a silent-bug factory once there are ten of them."""
+        would be a silent-bug factory once there are ten of them.
+
+        Every v2 field is optional. A collector with no constitutive model --
+        PyBullet mass-spring, which has no deformation gradient at all -- calls
+        this exactly as it did under v1 and gets a valid v2 file back.
+        """
         pos = _as(tissue_pos, np.float32, (-1, 3))
         if self._n_nodes is None:
             self._n_nodes = pos.shape[0]
@@ -190,12 +319,64 @@ class TrajectoryWriter:
         self._grasp_ids_flat.append(ids)
         self._grasp_offset.append(self._grasp_offset[-1] + ids.size)
 
+        # --- optional v2 per-step fields ----------------------------------
+        if self._require_consistent("tissue_F", tissue_F is not None):
+            F = _as(tissue_F, np.float32, (-1, 3, 3))
+            if F.shape[0] != self._n_nodes:
+                raise ValueError(
+                    f"tissue_F has {F.shape[0]} particles, tissue_pos has {self._n_nodes}")
+            self._F.append(F)
+        if self._require_consistent("contact_mode", contact_mode is not None):
+            if int(contact_mode) not in CONTACT_MODE_NAMES:
+                raise ValueError(
+                    f"contact_mode {contact_mode} is not one of "
+                    f"{sorted(CONTACT_MODE_NAMES)} ({CONTACT_MODE_NAMES})")
+            self._contact_mode.append(np.int8(contact_mode))
+        if self._require_consistent("exposure", exposure is not None):
+            self._exposure.append(np.float32(exposure))
+        if self._require_consistent("safety_strain", safety_strain is not None):
+            self._safety_strain.append(np.float32(safety_strain))
+
+    def _require_consistent(self, name: str, present: bool) -> bool:
+        """Lock an optional field to present-or-absent on its first append.
+
+        WHY: supplying `tissue_F` for some steps and not others yields an array
+        shorter than `tissue_pos`, and every downstream index into it is then
+        off by an amount that depends on which steps were skipped. Catching it
+        at the step it happens names the field; catching it at training time
+        does not.
+        """
+        have = self._optional_present.get(name)
+        if have is None:
+            self._optional_present[name] = present
+            return present
+        if have != present:
+            was, now = ("supplied", "omitted") if have else ("omitted", "supplied")
+            raise ValueError(
+                f"{name} was {was} on earlier steps and is {now} at step "
+                f"{len(self._pos) - 1}. Optional fields are all-or-nothing "
+                "within one episode.")
+        return present
+
     def close(self) -> str:
         if not self._pos:
             raise RuntimeError("nothing to write: append() was never called")
 
         flat = np.concatenate(self._grasp_ids_flat) if self._grasp_ids_flat \
             else np.zeros(0, np.int32)
+
+        # boundary_mask arrives before any append, so its length can only be
+        # checked here. A mask sized to the wrong mesh silently clamps the wrong
+        # particles, which looks like a physics bug rather than a bookkeeping one.
+        if self.boundary_mask.size and self.boundary_mask.size != self._n_nodes:
+            raise ValueError(
+                f"boundary_mask has {self.boundary_mask.size} entries but the "
+                f"episode has {self._n_nodes} nodes")
+
+        # float16 on disk, always float32 in memory (see the reader).
+        F_dtype = np.float16 if self.store_F_as_float16 else np.float32
+        tissue_F = np.stack(self._F).astype(F_dtype, copy=False) if self._F \
+            else np.zeros(0, F_dtype)
 
         np.savez_compressed(
             self.path,
@@ -206,6 +387,14 @@ class TrajectoryWriter:
             notes=self.notes,
             tissue_faces=self.tissue_faces,
             tissue_tets=self.tissue_tets,
+            material_params=self.material_params,
+            substep_dt=np.float32(self.substep_dt),
+            n_substeps=np.int32(self.n_substeps),
+            boundary_mask=self.boundary_mask,
+            action_spec=self.action_spec,
+            target_origin=self.target_origin,
+            target_normal=self.target_normal,
+            target_extent=self.target_extent,
             tissue_pos=np.stack(self._pos),
             tissue_vel=np.stack(self._vel),
             ee_pose=np.stack(self._ee_pose),
@@ -217,6 +406,10 @@ class TrajectoryWriter:
             contact_force=np.stack(self._force),
             grasp_ids_flat=flat.astype(np.int32),
             grasp_ids_offset=np.asarray(self._grasp_offset, np.int32),
+            tissue_F=tissue_F,
+            contact_mode=np.asarray(self._contact_mode, np.int8),
+            exposure=np.asarray(self._exposure, np.float32),
+            safety_strain=np.asarray(self._safety_strain, np.float32),
         )
         self._pos.clear()  # so __exit__ does not write a second time
         return self.path
@@ -248,6 +441,22 @@ class Trajectory:
     def n_nodes(self) -> int:
         return int(self._d["tissue_pos"].shape[1])
 
+    @property
+    def n_particles(self) -> int:
+        """Alias of `n_nodes`. MPM says "particles", FEM says "nodes"; they are
+        the same axis of the same array. The stored field keeps its v1 name
+        because four other files reference it -- consistency beats vocabulary."""
+        return self.n_nodes
+
+    @property
+    def has_F(self) -> bool:
+        """True when this episode carries deformation gradients.
+
+        Callers should branch on this rather than on the simulator name: what
+        matters is whether F was recorded, not which solver produced it.
+        """
+        return int(self._d["tissue_F"].size) > 0
+
     def grasp_ids(self, t: int) -> np.ndarray:
         """Node indices grasped at step t (variable length)."""
         off = self._d["grasp_ids_offset"]
@@ -256,21 +465,74 @@ class Trajectory:
     def __repr__(self) -> str:
         return (f"<Trajectory {os.path.basename(self.path)} "
                 f"sim={self._d['simulator']} task={self._d['task']} "
-                f"steps={len(self)} nodes={self.n_nodes} dt={float(self._d['dt']):.5f}>")
+                f"v{self._d['schema_version']} "
+                f"steps={len(self)} nodes={self.n_nodes} dt={float(self._d['dt']):.5f}"
+                f"{' +F' if self.has_F else ''}>")
 
 
 def load_trajectory(path: str) -> Trajectory:
-    """Read one .npz episode back into memory."""
+    """Read one .npz episode back into memory, upgrading older schemas in place."""
     with np.load(path, allow_pickle=False) as z:
         d = {k: z[k] for k in z.files}
     # numpy stores strings as 0-d arrays; unwrap them so they behave like str.
-    for k in ("schema_version", "simulator", "task", "notes"):
+    for k in ("schema_version", "simulator", "task", "notes", "action_spec"):
         if k in d:
             d[k] = str(d[k])
-    if d.get("schema_version") != SCHEMA_VERSION:
-        print(f"[trajectory_io] warning: {path} is schema "
-              f"{d.get('schema_version')}, this code expects {SCHEMA_VERSION}")
+
+    version = d.get("schema_version", "0.0")
+    if version not in KNOWN_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"{path} is schema {version}; this reader knows "
+            f"{KNOWN_SCHEMA_VERSIONS}. A file written by newer code cannot be "
+            "interpreted by guessing -- update trajectory_io.py instead.")
+    _upgrade_in_place(d)
     return Trajectory(d, path)
+
+
+def _upgrade_in_place(d: dict) -> None:
+    """Fill in fields a file predates, so every Trajectory looks like v2.
+
+    WHY THIS IS NOT A WARNING PRINT: v1 files are legitimate data, not a
+    mistake, and every consumer of this module would otherwise need its own
+    `if "tissue_F" in ...` branch. Normalising once here means
+    visualize_trajectory, validate_dataset and train_dynamics can read a v1 and
+    a v2 file through identical code paths.
+
+    Absent fields become EMPTY arrays rather than zeros -- see the module
+    docstring for why a zero default would be a lie for most of these.
+    """
+    empty = {
+        "material_params": np.float32,
+        "boundary_mask": bool,
+        "target_origin": np.float32,
+        "target_normal": np.float32,
+        "target_extent": np.float32,
+        "tissue_F": np.float32,
+        "contact_mode": np.int8,
+        "exposure": np.float32,
+        "safety_strain": np.float32,
+    }
+    for key, dtype in empty.items():
+        if key not in d:
+            d[key] = np.zeros(0, dtype)
+
+    # Scalars where 0 is unambiguous: a solver cannot take zero substeps, so
+    # zero reads as "not recorded" without colliding with a real value.
+    d.setdefault("substep_dt", np.float32(0.0))
+    d.setdefault("n_substeps", np.int32(0))
+    # v1's action was [target_xyz, grasp_flag] -- 4 wide, not 7, and not a pose.
+    # Naming it "abs_pose_jaw" would misdescribe both its width and its meaning.
+    d.setdefault("action_spec", "unknown")
+
+    # float16 is a storage format only. Upcast on read so every consumer sees
+    # one dtype: numpy.linalg promotes float16 to float64 anyway, and a metric
+    # that silently changes precision with a writer flag is a debugging trap.
+    if d["tissue_F"].dtype == np.float16:
+        d["tissue_F"] = d["tissue_F"].astype(np.float32)
+
+    # `schema_version` is deliberately NOT rewritten to SCHEMA_VERSION. It
+    # describes the file on disk, and a validator reporting "this v1 episode has
+    # no F" is more useful than one reporting "this v2 episode has no F".
 
 
 def list_trajectories(directory: str) -> list:
@@ -337,12 +599,16 @@ def _as(arr, dtype, shape) -> np.ndarray:
 
 if __name__ == "__main__":
     # Running this file directly is a self-test. If it prints OK, the format
-    # round-trips correctly on this machine.
+    # round-trips correctly on this machine. SETUP_GUIDE.md tells the user to
+    # run it, and verify_host.py / verify_container.py run it as a subprocess.
     import tempfile
 
     rng = np.random.default_rng(0)
     N, T = 40, 25
     with tempfile.TemporaryDirectory() as tmp:
+        # -- 1. a v1-style caller: no v2 arguments anywhere ------------------
+        # This is exactly how collect_retraction.py calls the writer. If this
+        # path ever needs editing, the v2 migration broke the PyBullet collector.
         p = os.path.join(tmp, "selftest.npz")
         with TrajectoryWriter(p, "selftest", "tissue_retraction", 1 / 240,
                               tissue_faces=rng.integers(0, N, (60, 3))) as w:
@@ -359,10 +625,76 @@ if __name__ == "__main__":
                     contact_force=rng.normal(size=3),
                 )
         tr = load_trajectory(p)
-        assert len(tr) == T and tr.n_nodes == N
+        assert len(tr) == T and tr.n_nodes == N and tr.n_particles == N
         assert tr.grasp_ids(0).size == 0 and tr.grasp_ids(10).tolist() == [1, 2, 3]
         x, u, y = make_transition_pairs(tr, horizon=1)
         assert x.shape == (T - 1, N * 6 + 7) and u.shape == (T - 1, 4) and y.shape == (T - 1, N * 3)
+        # Unsupplied v2 fields must be empty, not zero-filled: see the module
+        # docstring. 0.0 is a real exposure value and must stay distinguishable.
+        assert not tr.has_F and tr.tissue_F.size == 0
+        assert tr.exposure.size == 0 and tr.safety_strain.size == 0
+        assert tr.contact_mode.size == 0 and tr.material_params.size == 0
+        assert tr.boundary_mask.size == 0 and tr.action_spec == "unknown"
         print(tr)
         print(f"pairs: x{x.shape} u{u.shape} y{y.shape}")
-        print("OK -- trajectory_io round-trip passed")
+
+        # -- 2. a full v2 caller, with F stored as float16 -------------------
+        q = os.path.join(tmp, "selftest_v2.npz")
+        mask = np.zeros(N, bool)
+        mask[:4] = True
+        with TrajectoryWriter(
+                q, "selftest_mpm", "tissue_retraction", 0.010,
+                material_params=np.array([np.log(1500.0), np.log(2e5), 1050.0]),
+                substep_dt=2.5e-4, n_substeps=40,
+                boundary_mask=mask, action_spec="delta_pose_jaw",
+                target_origin=[0.0, 0.0, 0.0], target_normal=[0.0, 0.0, 1.0],
+                target_extent=[0.01, 0.01], store_F_as_float16=True) as w:
+            for t in range(T):
+                # F = a 25% uniaxial stretch, well clear of float16's ~1e-3
+                # resolution near 1.0 so the round-trip below is meaningful.
+                F = np.tile(np.diag([1.0 + 0.25 * t / T, 1.0, 1.0]), (N, 1, 1))
+                w.append(
+                    tissue_pos=rng.normal(size=(N, 3)),
+                    ee_pose=np.array([0, 0, 0.1 * t, 0, 0, 0, 1]),
+                    action=rng.normal(size=7),
+                    tissue_F=F,
+                    contact_mode=CONTACT_GRASP if t > 5 else CONTACT_NONE,
+                    exposure=0.01 * t,
+                    safety_strain=1.0 + 0.01 * t,
+                )
+        tv = load_trajectory(q)
+        assert tv.has_F and tv.tissue_F.shape == (T, N, 3, 3)
+        # float16 on disk, float32 in memory -- the writer flag must not leak
+        # into the dtype every downstream metric sees.
+        assert tv.tissue_F.dtype == np.float32
+        assert np.allclose(tv.tissue_F[-1, 0], np.diag([1.0 + 0.25 * (T - 1) / T, 1, 1]),
+                           atol=1e-3)
+        assert tv.contact_mode.shape == (T,) and tv.exposure.shape == (T,)
+        assert tv.boundary_mask.sum() == 4 and tv.action_spec == "delta_pose_jaw"
+        assert CONTACT_MODE_NAMES[int(tv.contact_mode[-1])] == "grasp"
+        assert abs(float(np.exp(tv.material_params[0])) - 1500.0) < 1.0
+        print(tv)
+
+        # -- 3. the mistakes the writer must refuse --------------------------
+        # An optional field supplied on some steps but not others produces a
+        # column shorter than tissue_pos, which nothing downstream detects.
+        try:
+            with TrajectoryWriter(os.path.join(tmp, "bad.npz"), "s", "t", 0.01) as w:
+                w.append(tissue_pos=np.zeros((N, 3)), ee_pose=np.zeros(7),
+                         action=np.zeros(7), exposure=0.5)
+                w.append(tissue_pos=np.zeros((N, 3)), ee_pose=np.zeros(7),
+                         action=np.zeros(7))
+            raise AssertionError("writer accepted a half-populated optional field")
+        except ValueError as e:
+            assert "all-or-nothing" in str(e)
+        try:
+            with TrajectoryWriter(os.path.join(tmp, "bad2.npz"), "s", "t", 0.01,
+                                  boundary_mask=np.zeros(N + 1, bool)) as w:
+                w.append(tissue_pos=np.zeros((N, 3)), ee_pose=np.zeros(7),
+                         action=np.zeros(7))
+            raise AssertionError("writer accepted a mis-sized boundary_mask")
+        except ValueError as e:
+            assert "boundary_mask" in str(e)
+
+        print("OK -- trajectory_io round-trip passed (v1-style and v2, "
+              "float16 F, upgrade path)")
