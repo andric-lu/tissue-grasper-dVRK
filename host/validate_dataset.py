@@ -78,6 +78,10 @@ MAX_VOLUME_DRIFT = 0.05     # 5% -- see check_F_incompressible
 METRIC_TOLERANCE = 1e-3     # logged vs recomputed exposure / safety_strain
 MIN_MATERIAL_SPREAD = 0.05  # in log units, across the dataset
 SUBSTEP_SLACK = 1.5         # how far over the advisory substep is tolerable
+MAX_BOUNDARY_DRIFT = 1e-5   # 10 um; a kinematic clamp should be exact, but a
+                            # solver that re-solves constraints each substep can
+                            # leave float-level residue. Deliberately far below
+                            # any real deformation -- see check_boundary_is_held
 
 # The MPM grid spacing the substep check assumes. It is not in the schema, so
 # it has to be assumed somewhere; assume it loudly rather than silently.
@@ -209,6 +213,43 @@ def check_grasp_is_consistent(tr) -> Result:
                             f"first at {empty[0]}")
     return Result(PASS, f"grasped {tr.grasp_ids(int(np.argmax(grasp))).size} node(s) "
                         f"for {int(grasp.sum())}/{len(tr)} steps")
+
+
+@check()
+def check_boundary_is_held(tr) -> Result:
+    """Particles marked kinematically clamped do not move."""
+    # WHY: this is the file-level detector for the failure that ruined the first
+    # dataset in this project -- anchors silently not holding, so the recorded
+    # motion is rigid translation with no strain field in it (§3.5). That was
+    # found by noticing peak displacement equalled the gripper's own travel,
+    # which required knowing the gripper's travel and thinking to compare. This
+    # asserts the property directly, from the file alone, referencing nothing
+    # outside it.
+    #
+    # It catches the inverse error too: a mask claiming a clamp the motion does
+    # not honour. That is a file lying about itself, and anything trusting
+    # boundary_mask believes it -- a graph network treating those particles as
+    # fixed anchors, or a loss that excludes them from the residual.
+    if tr.boundary_mask.size == 0:
+        return Result(SKIP, f"no boundary_mask recorded (schema "
+                            f"{tr.schema_version}, simulator {tr.simulator})")
+    mask = tr.boundary_mask.astype(bool)
+    n = int(mask.sum())
+    if n == 0:
+        # A legitimate reading, not a missing one -- see the empty-vs-all-False
+        # distinction in trajectory_io. Nothing is clamped, so nothing to check.
+        return Result(PASS, "boundary_mask recorded; no particles are clamped")
+    pos = tr.tissue_pos.astype(np.float64)
+    drift = np.linalg.norm(pos[:, mask] - pos[0, mask], axis=2).max(axis=0)
+    worst = float(drift.max())
+    if worst > MAX_BOUNDARY_DRIFT:
+        n_moved = int(np.count_nonzero(drift > MAX_BOUNDARY_DRIFT))
+        return Result(FAIL, f"{n_moved} of {n} clamped particle(s) moved; worst "
+                            f"{worst*1000:.4f} mm against a "
+                            f"{MAX_BOUNDARY_DRIFT*1000:.4f} mm limit -- either the "
+                            "constraint is not holding or boundary_mask is wrong")
+    return Result(PASS, f"{n} clamped particle(s), max movement "
+                        f"{worst*1e6:.3f} um")
 
 
 @check()
