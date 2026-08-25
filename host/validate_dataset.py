@@ -76,6 +76,13 @@ UNSTABLE_SPEED = 1.0        # m/s; matches visualize_trajectory.py deliberately
 MIN_MOTION_MM = 1.0         # below this an episode carries no dynamics signal
 MAX_VOLUME_DRIFT = 0.05     # 5% -- see check_F_incompressible
 METRIC_TOLERANCE = 1e-3     # logged vs recomputed exposure / safety_strain
+SUBSET_STRAIN_MARGIN = 0.50 # how far a stored SUBSET's peak stretch may fall
+                            # short of the logged full-set value, as a fraction
+                            # of the stretch above rest. Measured at 0.08 for
+                            # 3,000 of 24,000 particles and 0.17 for 500, so
+                            # 0.50 only fires on a subset that has stopped
+                            # describing the same episode -- see
+                            # check_logged_metrics_match_recomputation
 MIN_MATERIAL_SPREAD = 0.05  # in log units, across the dataset
 SUBSTEP_SLACK = 1.5         # how far over the advisory substep is tolerable
 MAX_BOUNDARY_DRIFT = 1e-5   # 10 um; a kinematic clamp should be exact, but a
@@ -304,18 +311,39 @@ def check_substep_is_stable_for_stiffness(tr) -> Result:
         return Result(SKIP, "no material parameters recorded")
     if float(tr.substep_dt) <= 0.0:
         return Result(SKIP, "substep_dt not recorded")
-    mu, _, rho = unpack_material(tr.material_params)
-    advised = float(suggested_substep_dt(mu, rho, ASSUMED_MPM_DX))
+    # WHY dx IS READ RATHER THAN ASSUMED: the advisory scales linearly with dx,
+    # so assuming it is wrong by exactly the ratio you guessed wrong. The first
+    # real MPM episode proved the point -- this check assumed 1.0 mm while the
+    # solver's dx is 1/64 m = 15.6 mm, and FAILed a perfectly stable episode by
+    # a factor of 15.6. dx is a property of the solver, not of the universe, so
+    # schema v2.1 records it. ASSUMED_MPM_DX now only covers files written
+    # before that field existed, and the message says when it is in use.
+    mu, lam, rho = unpack_material(tr.material_params)
+    recorded_dx = float(tr.grid_dx)
+    dx = recorded_dx if recorded_dx > 0.0 else ASSUMED_MPM_DX
+    dx_note = (f"dx {dx*1e3:.2f} mm recorded" if recorded_dx > 0.0
+               else f"dx assumed {dx*1e3:.1f} mm, NOT recorded in this file")
+
+    # WHY THE P-WAVE BOUND: the bar-wave advisory ignores lambda, and tissue is
+    # nearly incompressible, so lambda/mu reaches ~750 in materials.py's ranges.
+    # Judged on the bar wave, every episode this collector produced looked safe;
+    # three of six then diverged, one badly enough that det(F) went non-finite.
+    # The P-wave bound flagged exactly those three. Passing `lam` is the whole
+    # difference between a check that would have caught it and one that did not.
+    advised = float(suggested_substep_dt(mu, rho, dx, lam=lam))
     actual = float(tr.substep_dt)
     ratio = actual / advised
     if ratio > SUBSTEP_SLACK:
         return Result(FAIL, f"substep {actual*1e6:.1f} us is {ratio:.1f}x the advisory "
-                            f"{advised*1e6:.1f} us for mu={float(mu):.0f} Pa "
-                            f"(dx assumed {ASSUMED_MPM_DX*1e3:.1f} mm)")
-    # The advisory itself is an upper bound -- it uses the shear wave speed and
-    # ignores the faster pressure wave -- so being well under it is expected.
-    return Result(PASS, f"substep {actual*1e6:.1f} us vs advisory "
-                        f"{advised*1e6:.1f} us (ratio {ratio:.2f})")
+                            f"{advised*1e6:.1f} us for mu={float(mu):.0f} Pa, "
+                            f"lambda={float(lam):.0f} Pa ({dx_note}). "
+                            f"lambda/mu={float(lam)/float(mu):.0f}: this is the "
+                            "pressure wave, not the shear wave")
+    # Passing means "not obviously unstable", not "converged". Only a timestep
+    # study establishes the latter, which is what section 4 is still open about.
+    return Result(PASS, f"substep {actual*1e6:.1f} us vs P-wave advisory "
+                        f"{advised*1e6:.1f} us (ratio {ratio:.2f}, {dx_note}, "
+                        f"lambda/mu={float(lam)/float(mu):.0f})")
 
 
 @check()
@@ -340,6 +368,55 @@ def check_contact_mode_transitions(tr) -> Result:
                             "that is chattering, not contact")
     seen = ", ".join(sorted({CONTACT_MODE_NAMES[v] for v in np.unique(m)}))
     return Result(PASS, f"{n_changes} transition(s); modes seen: {seen}")
+
+
+@check()
+def check_particle_subset_is_coherent(tr) -> Result:
+    """particle_ids, n_particles_simulated and the node count agree."""
+    # WHY: a subset record makes three claims that can silently disagree -- how
+    # many particles the solver stepped, which of them were kept, and how many
+    # columns the per-particle arrays actually have. Each disagreement corrupts
+    # something different and none of them raise:
+    #
+    #   duplicate ids       one particle stored as two nodes. Perfectly
+    #                       correlated columns that look like independent
+    #                       samples, which inflates apparent dataset size and
+    #                       lets a model score well by copying a neighbour.
+    #   ids longer/shorter  the mapping from node index back to solver particle
+    #       than the nodes  is off, so boundary_mask and grasp ids address the
+    #                       wrong particles.
+    #   n_sim < n_nodes     a subset larger than the set it came from. Whatever
+    #                       produced that number is not counting the same thing.
+    #
+    # The writer refuses all of these, so a file that fails here was either
+    # written by something else or edited after the fact.
+    n_sim = int(tr.n_particles_simulated)
+    ids = tr.particle_ids
+    if n_sim == 0 and ids.size == 0:
+        return Result(SKIP, f"no subset bookkeeping recorded (schema "
+                            f"{tr.schema_version}); episode is {tr.n_nodes} nodes "
+                            "with no stated relation to a solver particle array")
+
+    bad = []
+    if n_sim and n_sim < tr.n_nodes:
+        bad.append(f"n_particles_simulated={n_sim} < {tr.n_nodes} nodes recorded")
+    if ids.size:
+        if ids.size != tr.n_nodes:
+            bad.append(f"particle_ids has {ids.size} entries, {tr.n_nodes} nodes")
+        if np.unique(ids).size != ids.size:
+            dup = ids.size - np.unique(ids).size
+            bad.append(f"{dup} duplicate particle_id(s)")
+        if ids.min() < 0:
+            bad.append(f"negative particle_id {int(ids.min())}")
+        if n_sim and ids.max() >= n_sim:
+            bad.append(f"particle_id {int(ids.max())} >= n_particles_simulated={n_sim}")
+    if bad:
+        return Result(FAIL, "; ".join(bad))
+
+    if not tr.is_subset:
+        return Result(PASS, f"all {tr.n_nodes} simulated particles recorded")
+    return Result(PASS, f"{tr.n_nodes} of {n_sim} particles recorded "
+                        f"({tr.subset_fraction:.1%}), ids unique and in range")
 
 
 @check()
@@ -368,6 +445,49 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
     if tr.safety_strain.size:
         if not tr.has_F:
             problems.append("safety_strain logged but no F to recompute it from")
+        elif tr.is_subset:
+            # WHY AN INEQUALITY HERE: safety_strain is a MAXIMUM over particles.
+            # When the file stores a subset, the recorded F cannot reproduce the
+            # logged value and is not meant to -- the logged value is computed
+            # over every simulated particle precisely so that dropping particles
+            # cannot make the tissue look safer than it was. Demanding equality
+            # would punish the writer for doing the right thing.
+            #
+            # But an inequality still has teeth, in both directions:
+            #
+            #   got > logged   The subset found a stretch the full set did not.
+            #                  Impossible if the logged value really is a max
+            #                  over a superset, so something is wrong: the
+            #                  metric was computed over the subset, or
+            #                  particle_ids and tissue_F disagree about which
+            #                  particles these are. Hard failure.
+            #
+            #   got << logged  The subset is too unrepresentative to corroborate
+            #                  the logged number at all. Expected to be small --
+            #                  measured at 8% of the stretch above rest for
+            #                  3,000 of 24,000 particles -- so the margin below
+            #                  is generous and only fires on something broken.
+            got = compute_safety_strain(tr.tissue_F)["max"]
+            logged = tr.safety_strain.astype(np.float64)
+            over = float((got - logged).max())
+            if over > METRIC_TOLERANCE:
+                problems.append(
+                    f"safety_strain over a {tr.n_nodes}/"
+                    f"{int(tr.n_particles_simulated)} subset EXCEEDS the logged "
+                    f"full-set value by {over:.2e}; a subset maximum cannot beat "
+                    "the maximum it is drawn from, so the logged metric was not "
+                    "computed over all particles")
+            # Stretch above rest, floored so a resting episode is not judged on
+            # a division by zero.
+            head = np.maximum(logged - 1.0, 1e-6)
+            short = float(((logged - got) / head).max())
+            if short > SUBSET_STRAIN_MARGIN:
+                problems.append(
+                    f"safety_strain over the stored subset underestimates the "
+                    f"logged value by {short:.0%} of the stretch above rest "
+                    f"(limit {SUBSET_STRAIN_MARGIN:.0%}); {tr.n_nodes} of "
+                    f"{int(tr.n_particles_simulated)} particles is too few to "
+                    "corroborate the safety metric")
         else:
             got = compute_safety_strain(tr.tissue_F)["max"]
             err = float(np.abs(got - tr.safety_strain.astype(np.float64)).max())

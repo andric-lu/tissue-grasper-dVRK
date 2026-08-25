@@ -782,6 +782,200 @@ particle state, write a v2 trajectory — is the next piece of code, and it is
 small precisely because §8 built its receiving end first.
 
 ---
+
+### 9.4 The MPM smoke test: all three questions closed, two new facts
+
+`host/smoke_test_mpm.py`, 17 August 2026. **15 checks pass, 0 fail, 1 warns.**
+The MPM runs on this machine, on the GPU, and its output goes into a v2 `.npz`.
+
+The four files were vendored at `third_party/MPM/` from `Dev` at
+**`cb797f360bb16ea629b449cb902a1dae60c46e81`** (2024-05-21), byte-identical to
+upstream, with `third_party/PROVENANCE.md` recording the SHA, the sparse-checkout
+command that fetched them, and a `sha256` per file.
+
+**Q1 — the private Taichi API. Closed, favourably.** `ti._lib.core.with_metal()`,
+`with_vulkan()` and `with_cuda()` all still exist on 1.7.4 despite the code
+pinning 1.6.0, returning `True / True / False`. `mpm3d.py` selects `ti.metal`,
+and — the question that actually mattered — `ti.lang.impl.current_cfg().arch`
+reads back `Arch.metal` after import. The silent CPU fallback did not happen.
+
+Both halves of that are checked, because they are different claims.
+`with_metal()` returning `True` says only that the Taichi binary was *built*
+with Metal support; `ti.init()` can still fall back at runtime and mention it
+in a log line nobody reads. Asking only the first question would have confirmed
+the guard works while saying nothing about what it selected.
+
+Worth keeping in mind: `mpm3d.py` calls `ti.init()` at **module level**
+(lines 14–22). Importing it *is* the backend decision. Nothing downstream can
+choose an arch, and any script wanting a different one must set it before the
+import.
+
+**The backend check was demonstrated against the failure, per §5.** A check only
+ever seen passing has not been shown to work, so the CPU fallback was forced:
+
+```bash
+TI_ARCH=arm64 python host/smoke_test_mpm.py    # Q1b FAILs, exit 1
+```
+
+(`TI_ARCH=cpu` is *not* a valid arch name on 1.7.4 — it aborts the process with
+`RHI Error: Unknown architecture name: cpu` and SIGABRT. On Apple Silicon the CPU
+arch is `arm64`. Worth knowing before reading that abort as a broken install.)
+
+That run reported `backend=Arch.arm64, NOT metal` and exited 1, which is the
+behaviour wanted. It also produced the number that had been guesswork: **Metal
+is 8.1× faster**, 0.64 ms/substep against 5.17 on the CPU. Earlier drafts of this
+check asserted "10–30×" from general knowledge; the measured figure is lower, and
+is now what the code says.
+
+The other half of that result is the more important one: **the CPU run settled
+the cube to −4.39 mm against Metal's −4.46 mm**, within 2%. Correct physics,
+wrong speed, no error anywhere — the failure mode §9.3 predicted, reproduced on
+demand and confirmed to be invisible without this check.
+
+**Q2 — the missing host dependencies. Closed, but not by a plain install.**
+`scikit-image` 0.26.0 came from a wheel. **PyBullet did not build**, and §9.3's
+prediction that it would merely be slow was wrong — it *fails*:
+
+```
+zutil.h:128:   #ifndef fdopen
+               #define fdopen(fd, mode) NULL   /* No fdopen() */
+               #endif
+_stdio.h:322:  error: expected identifier or '('
+```
+
+PyBullet vendors a very old zlib. `gzguts.h` includes the system `<stdio.h>`
+*after* that macro is defined, so the macro rewrites the SDK's real declaration
+of `fdopen` into `FILE *((void*)0)(int, const char *)`. Modern macOS SDK, 2013
+zlib.
+
+The guard is `#ifndef fdopen` — not zlib's later `#ifndef HAVE_FDOPEN` — so the
+usual `-DHAVE_FDOPEN` does nothing. What works is defining the macro to itself:
+
+```bash
+export CFLAGS="-Dfdopen=fdopen" CXXFLAGS="-Dfdopen=fdopen"
+pip install pybullet
+```
+
+C does not rescan a macro that expands to its own name, so `fdopen` stays
+`fdopen`, `#ifndef fdopen` is false, and the bad `#define` is skipped. Built
+`pybullet==3.2.7` in about four minutes. This is now in `host/environment.yml`
+with the reasoning, but the flag has to be exported *before* `conda env create`
+— a YAML file cannot set it, so an unprepared `conda env create` still fails
+here. That is the one rough edge left in the host recipe.
+
+Rejected: conda-forge's `pybullet`, which has an osx-arm64 build and would have
+been one line. It would have put a compiled package from a second package
+manager into an environment whose entire numerical stack comes from pip — the
+thing §3.2 exists to prevent. A four-minute build is cheaper than re-litigating
+`OMP: Error #15`.
+
+**Q3 — the import path. Closed, as expected.** `third_party/` goes on
+`sys.path`, not `third_party/MPM/`. `from MPM.config import ...` is an absolute
+import of a top-level package named `MPM`; putting the inner directory on the
+path makes `config` importable and `MPM.config` still fail. There is no
+`__init__.py` and none is needed — it resolves as a PEP 420 namespace package,
+which is also how the vendored tree stays byte-identical to upstream.
+
+#### New fact 1: `set_parameters()` takes (E, ν), and §9.3 said otherwise
+
+§9.3 recorded "Neo-Hookean … with μ/λ from `set_parameters()`" and concluded
+`materials.py` "is not approximately right for this interface, it is exactly
+right." The first half is wrong. The signature is:
+
+```python
+def set_parameters(s_E=8000, s_nu=0.2):
+    mu[None] = E[None] / (2 * (1 + nu[None]))
+    la[None] = E[None] * nu[None] / ((1 + nu[None]) * (1 - 2 * nu[None]))
+```
+
+It takes **(E, ν)** and performs internally the exact conversion §8.3 exists to
+keep out of the sampling path — the one singular at ν = 0.5, in float32, with a
+default `s_nu=0.2` nowhere near tissue. Feeding it a sampled (μ, λ) means
+inverting to (E, ν) and letting it convert back: a round trip *through* the
+singularity, to recover numbers we already had.
+
+Measured rather than assumed, over the five corners of `materials.py`'s ranges:
+**worst relative error 2.7e-4**, at μ = 200, λ = 2×10⁶ (ν = 0.499950). Small —
+smaller than the placeholder ranges' own uncertainty — so this was never going
+to be the bug that ate a week. But it is avoidable for nothing: `mu` and `la`
+are plain 0-d Taichi fields, the solver reads *only* those two, and writing them
+directly round-trips exactly (relative error 0.0).
+
+**The adapter will write `mu[None]` and `la[None]` directly and never call
+`set_parameters()`.** §8.3's rule survives contact with its first real consumer,
+which is the outcome that matters; it just needs one more line of code than §9.3
+thought.
+
+The wider point is that §9.3 reached "exactly right" by reading the paper's
+description and the field names, without running anything. Four of its claims
+held and one did not, and the one that did not is the one that touches the
+project's sharpest rule.
+
+#### New fact 2: the first run takes ten seconds and is not hung
+
+Steady state is **0.64 ms/substep** — 24 000 particles on a 64³ grid, 62
+frames/s against 80 for realtime, so roughly 0.8× realtime on the M3 Max GPU.
+
+But the *first* substep on a fresh machine takes **~10 s**, compiling P2G,
+Boundary and G2P for Metal. Taichi caches the result under `~/.cache/taichi`,
+after which it is ~0.56 s. Confirmed by disabling the cache: `TI_OFFLINE_CACHE=0`
+puts it straight back to 9.68 s, with steady-state speed unchanged at 0.64 ms.
+So it is compilation, not a slow first step, and the timing number to quote is
+the steady-state one.
+
+This matters only because a ten-second silent pause on a fresh clone looks
+exactly like a hang, and §2.2 and §9.3 both already had to say the same thing
+about PyBullet's build. Third instance of the pattern: **on this project, a long
+silence is usually a compiler.**
+
+#### What the test does that is worth keeping
+
+`substep()` reads the module globals `SDF` and `collision_mask`, which are
+`None` until `step()` rebinds them from fields in `sdf.py` (`mpm3d.py:492–494`).
+The test binds them by hand and fills the SDF with a large positive distance,
+which means the solver can be driven **with no PyBullet scene at all** — the
+collision branch is never taken, so no neighbour of `SDF` is ever indexed. That
+is the seam the PSM plugs into later, and being able to run without it is what
+makes this a smoke test rather than an integration test.
+
+Two physics checks, not one, because they fail differently:
+
+- **Free fall**, cube lifted clear of the floor, checked against analytic
+  −g·t: −0.12250 m/s vs −0.12250, 0.00 % off. This confirms both the axis
+  (`Boundary()` applies gravity to `F_grid_v[I][2]`, the PyBullet convention,
+  having abandoned Taichi's y on the line above) *and* the magnitude. A sign
+  test alone would pass on a solver using the wrong g.
+- **Settling under contact**, the default spawn, which deforms the material:
+  J = det(F) ∈ [0.8575, 1.0750], mean 0.9971, all finite, none inverted.
+
+The first version of the gravity check **failed**, reporting `v_z = +0.0667 m/s`.
+That was the test's fault, not the solver's: `init_cube()` spawns particles at
+z ∈ [0.05, 0.10] while the floor is the `bound = 3` band at z = 3·dx = 0.047, so
+the cube starts already in contact and what was being measured was elastic
+rebound. Recorded because it is the §5 discipline working — the check was
+specific enough to be wrong in an informative way, rather than vague enough to
+pass. Fixing it produced a strictly better check, against an analytic value
+instead of a sign.
+
+Finally, the mapping §9.3 called "small" is now verified rather than hoped for:
+`F_x → tissue_pos` (24000, 3), `F_v → tissue_vel` (24000, 3), `F → tissue_F`
+(24000, 3, 3), all float32, all lining up with the v2 schema without a reshape,
+and two frames written through `TrajectoryWriter` and read back at
+(2, 24000, 3, 3) for 2.6 MB.
+
+**One number that should worry us:** 2.6 MB for two frames, essentially all of
+it `tissue_F`. Nine floats per particle per step, at 24 000 particles, is
+864 KB/frame. A 100-step episode is ~86 MB and twenty of them is ~1.7 GB.
+`trajectory_io.py` already anticipated this — its `store_F_as_float16` flag and
+the "WHEN TO ACTUALLY MAKE THAT SWAP" note name `tissue_F` as the trigger. It
+has now been reached. Not resolved here, but it is no longer hypothetical.
+
+**Still not done, unchanged from §9.3:** nothing writes MPM state to `.npz` as
+part of a real episode. The adapter is still the next piece of code — but it now
+starts from a verified mapping, a known-good parameter interface, and a solver
+that has actually run.
+
+---
 ## 10. Files
 
 Every path below was checked against the repository on 17 August 2026.
@@ -819,6 +1013,9 @@ copy is the shareable view, not the only copy.
 | `host/train_dynamics.py` | macOS | MLP baseline on MPS | |
 | `host/visualize_trajectory.py` | macOS | 3D animation + stability diagnostics | |
 | `host/validate_dataset.py` | macOS | 14 data-integrity checks | §8.5, §9.2 |
+| `host/smoke_test_mpm.py` | macOS | MPM smoke test, 15 checks | §9.4, **passes** |
+| `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
+| `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |

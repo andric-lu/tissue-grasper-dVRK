@@ -10,6 +10,11 @@ data/**/*.npz
 # data_synth/ is regenerable in seconds from src/synthetic_traj.py, so the
 # SCRIPT is the artifact worth versioning, not its output.
 data_synth/*.npz
+# data_mpm/ is MPM adapter output: regenerable from host/mpm_adapter.py + seed,
+# and large -- tissue_F alone is 864 KB/frame at 24k particles, so twenty
+# 100-step episodes is ~1.7 GB. Ignoring the whole directory, not just *.npz,
+# because nothing in it is authored by hand.
+data_mpm/
 models/*.pt
 runs/
 *.mp4
