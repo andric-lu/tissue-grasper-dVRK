@@ -189,9 +189,14 @@ def suggested_substep_dt(mu: ArrayLike, rho: ArrayLike, dx: ArrayLike,
     silently on a stiff one, and the resulting dataset looks plausible until a
     model trained on it refuses to learn.
 
-    E is taken as 3*mu, the near-incompressible limit (E = 2*mu*(1 + nu) with
-    nu -> 0.5). That is the right substitution for tissue and it keeps this
-    function's signature free of lambda.
+    WITHOUT `lam`, E is taken as 3*mu, the near-incompressible limit
+    (E = 2*mu*(1 + nu) with nu -> 0.5). That substitution is what lets a caller
+    who has only mu get an answer at all, and it is why the lam-less result is
+    a bar-wave upper bound rather than the real thing. WITH `lam`, no such
+    substitution happens: the P-wave speed sqrt((lambda + 2*mu)/rho) is used
+    directly, which is the bound tissue actually obeys. New callers should pass
+    it; the default stays lam-less only because v1 and PyBullet callers predate
+    the argument and must keep getting what they always got.
 
     KNOWN LIMITATION (applies only when `lam` is omitted): for a nearly
     incompressible material lambda >> mu, and the pressure (P-wave) speed

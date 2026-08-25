@@ -64,6 +64,7 @@ from trajectory_io import (  # noqa: E402
     CONTACT_GRASP,
     CONTACT_MODE_NAMES,
     CONTACT_NONE,
+    TIMEBASE_TOLERANCE,
     list_trajectories,
     load_trajectory,
 )
@@ -76,6 +77,15 @@ UNSTABLE_SPEED = 1.0        # m/s; matches visualize_trajectory.py deliberately
 MIN_MOTION_MM = 1.0         # below this an episode carries no dynamics signal
 MAX_VOLUME_DRIFT = 0.05     # 5% -- see check_F_incompressible
 METRIC_TOLERANCE = 1e-3     # logged vs recomputed exposure / safety_strain
+SUBSET_EXPOSURE_MARGIN = 0.25  # how far a stored SUBSET's exposure may sit
+                            # ABOVE the logged full-set value before the subset
+                            # is judged too sparse to corroborate it. Exposure
+                            # is a fraction in [0, 1], so this is 25% of the
+                            # whole range. Measured: 3,000 of 24,000 particles
+                            # moved it by 1.4e-3, and even 300 of 24,000 only
+                            # reached 0.12, so this fires on a subset that has
+                            # stopped representing the tissue, not on one that
+                            # is merely smaller.
 SUBSET_STRAIN_MARGIN = 0.50 # how far a stored SUBSET's peak stretch may fall
                             # short of the logged full-set value, as a fraction
                             # of the stretch above rest. Measured at 0.08 for
@@ -347,6 +357,41 @@ def check_substep_is_stable_for_stiffness(tr) -> Result:
 
 
 @check()
+def check_timebase_is_consistent(tr) -> Result:
+    """dt equals substep_dt x n_substeps: a frame advances the time it claims."""
+    # WHY: this is the one inconsistency a file cannot show you. dt, substep_dt
+    # and n_substeps are each individually plausible; only their product is
+    # wrong, and every downstream velocity and finite difference is silently
+    # scaled by the ratio. The MPM adapter shipped exactly this bug -- it chose
+    # n_substeps from the material's P-wave bound, wrote that number to disk,
+    # and then integrated with the vendored module default of 25 instead. For
+    # the stiffest sampled material the recorded frame claimed 12.5 ms and
+    # delivered 2.95 ms, a factor of 4.2, with every check then in existence
+    # passing. A model trained on it would have learned tissue four times too
+    # stiff and no diagnostic would have pointed here.
+    #
+    # The writer now refuses to create such a file. This check exists for the
+    # ones already on disk, and for any writer that is not TrajectoryWriter.
+    if float(tr.substep_dt) <= 0.0 or int(tr.n_substeps) <= 0:
+        return Result(SKIP, "substep_dt / n_substeps not both recorded "
+                            "(v1 files and the PyBullet collector record neither)")
+    dt = float(tr.dt)
+    if dt <= 0.0:
+        return Result(SKIP, "dt not recorded")
+    implied = float(tr.substep_dt) * int(tr.n_substeps)
+    rel = abs(implied - dt) / dt
+    if rel > TIMEBASE_TOLERANCE:
+        return Result(FAIL,
+                      f"substep_dt {float(tr.substep_dt)*1e6:.2f} us x "
+                      f"{int(tr.n_substeps)} substeps = {implied*1e3:.4f} ms, but "
+                      f"dt is {dt*1e3:.4f} ms -- a factor of {implied/dt:.3f}. "
+                      "Every recorded frame advances a different amount of time "
+                      "than the file claims")
+    return Result(PASS, f"dt {dt*1e3:.4f} ms = {int(tr.n_substeps)} x "
+                        f"{float(tr.substep_dt)*1e6:.2f} us (to {rel:.1e})")
+
+
+@check()
 def check_contact_mode_transitions(tr) -> Result:
     """Contact modes change in a physically reachable order."""
     # WHY: two specific failures. (1) NONE -> GRASP in a single step means the
@@ -439,9 +484,51 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
                                tr.target_normal, tr.target_extent,
                                sigma=DEFAULT_SIGMA, threshold=DEFAULT_THRESHOLD,
                                grid=DEFAULT_GRID)
-        err = float(np.abs(got - tr.exposure.astype(np.float64)).max())
-        if err > METRIC_TOLERANCE:
-            problems.append(f"exposure differs by up to {err:.2e}")
+        logged = tr.exposure.astype(np.float64)
+        if tr.is_subset:
+            # WHY AN INEQUALITY HERE, exactly as for safety_strain below.
+            # Exposure is the fraction of the target NOT occluded by tissue.
+            # Removing particles can only remove occluders, so a subset can
+            # only ever look MORE exposed than the full set it was drawn from.
+            # Equality is therefore the wrong claim, and it was failing on
+            # correct data: the first fresh MPM episode logged 0.0 exposure
+            # over 24,000 particles and recomputed 1.44e-3 over the stored
+            # 3,000 -- a real, expected, monotone gap, rejected as drift by a
+            # 1e-3 equality bound. The earlier pair of episodes passed the same
+            # bound at 7.4e-4 purely because they were closer to it.
+            #
+            # The inequality still has teeth in both directions:
+            #
+            #   got < logged   IMPOSSIBLE. A subset cannot occlude more than
+            #                  its superset. Means the logged value was
+            #                  computed over the subset (so it is not the
+            #                  full-set metric it claims to be), or
+            #                  particle_ids and tissue_pos disagree about which
+            #                  particles these are. Hard failure.
+            #
+            #   got >> logged  The subset is too sparse to corroborate the
+            #                  logged number at all -- it has stopped
+            #                  occluding anything the full set occluded.
+            under = float((logged - got).max())
+            if under > METRIC_TOLERANCE:
+                problems.append(
+                    f"exposure over a {tr.n_nodes}/"
+                    f"{int(tr.n_particles_simulated)} subset falls BELOW the "
+                    f"logged full-set value by {under:.2e}; removing particles "
+                    "cannot add occlusion, so the logged metric was not "
+                    "computed over all particles")
+            over = float((got - logged).max())
+            if over > SUBSET_EXPOSURE_MARGIN:
+                problems.append(
+                    f"exposure over the stored subset exceeds the logged "
+                    f"full-set value by {over:.2f} (limit "
+                    f"{SUBSET_EXPOSURE_MARGIN:.2f}); {tr.n_nodes} of "
+                    f"{int(tr.n_particles_simulated)} particles is too few to "
+                    "corroborate the occlusion metric")
+        else:
+            err = float(np.abs(got - logged).max())
+            if err > METRIC_TOLERANCE:
+                problems.append(f"exposure differs by up to {err:.2e}")
     if tr.safety_strain.size:
         if not tr.has_F:
             problems.append("safety_strain logged but no F to recompute it from")
@@ -496,6 +583,17 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
     if problems:
         return Result(FAIL, "; ".join(problems) +
                       f" (tolerance {METRIC_TOLERANCE:.0e})")
+    # WORDING MATTERS HERE. "reproduce" is a claim about equality, and for a
+    # subset record it is false: the stored particles cannot reproduce a metric
+    # computed over every particle, and are not supposed to. Saying they did
+    # would train the reader to expect equality and to treat the (correct)
+    # inequality branch as a weaker check rather than a different one.
+    if tr.is_subset:
+        return Result(PASS, f"logged metrics consistent with full-set bounds "
+                            f"over a {tr.n_nodes}/"
+                            f"{int(tr.n_particles_simulated)} subset "
+                            f"({tr.subset_fraction:.1%}): exposure not below, "
+                            "peak stretch not above")
     return Result(PASS, f"logged metrics reproduce to {METRIC_TOLERANCE:.0e}")
 
 
