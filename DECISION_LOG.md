@@ -1253,6 +1253,221 @@ about a passive-settling episode.
 - **§4 is still open** for the PyBullet side. Nothing here touches it.
 
 ---
+
+### 9.6 The substep study: a negative result, and the right kind
+
+25 August 2026. `host/substep_study.py`. The question was whether `safety = 0.3`
+in the P-wave advisory is *converged* or merely *stable* — §9.5 and
+`check_substep_is_stable_for_stiffness` both flagged that nothing had ever
+tested it.
+
+**The answer is that it is stable, that it is not converged, and that no value
+of it can be — because a substep-refinement study is the wrong instrument for
+MPM at a fixed grid resolution.** That last part was not the expected outcome
+and is the reason this section is worth its length.
+
+#### Design
+
+Hold everything fixed except the substep count: same material, same seed, same
+`frame_dt`, same recorded subset, same frame count. Sweep `n_substeps` from ¼ of
+the advisory count to 8×. Both materials from `data_mpm/`, because the advisory
+is a *formula* that scales with the material — testing it at one material tests
+a constant.
+
+One child process per row, for the §9.5 reason: `dt` and `p_mass` are baked into
+kernels at compile time. Children run with `check=False`, because the coarse rows
+are *expected* to fail and a study that dies on its first divergence has tested
+nothing.
+
+**The measurement is unusually clean here, and §9.5's limitation is why.**
+`mpm3d.py` calls `ti.init()` with no `random_seed`, so every process lays out an
+identical particle cloud, and `MPMRecorder`'s subset is drawn from a fixed seed.
+Particle *i* is therefore the same lump of material in every row, which allows a
+**field-by-field** comparison rather than a comparison of summary scalars.
+§9.5 recorded that fixed seed as a defect narrowing dataset diversity; for this
+study it is a gift. The parent asserts it rather than trusting it.
+
+The primary measure is the RMS final-position difference from the finest row,
+normalised by that row's own RMS displacement — not peak stretch. A maximum over
+3,000 particles is a single order statistic and can move several percent because
+one particle overtook another.
+
+#### The tables
+
+```
+soft-lambda:  mu = 3758 Pa   lambda = 69279 Pa   rho = 1004.1   lambda/mu = 18
+  advisory at safety=0.3: 24 substeps/frame (520.8 us);  60 frames, seed 0
+
+  n_sub    substep   safety  peak stretch  max|J-1|  peak disp   KE final    wall
+      6   2083.3us    1.200      DIVERGED                         1.4s   (frame 3/60)
+     12   1041.7us    0.600       1.18208    0.2050    8.85mm  1.208e-01    9.6s
+     24    520.8us    0.300       1.16868    0.1872    8.49mm  2.484e-02   10.1s
+     48    260.4us    0.150       1.14124    0.1719    8.08mm  1.630e-03   11.0s
+     96    130.2us    0.075       1.10763    0.1595    7.50mm  6.887e-04   12.7s
+    192     65.1us    0.037       1.07401    0.1356    6.70mm  4.077e-04   16.3s
+
+    n_sub   safety   field err     horiz      vert  d(stretch)
+       12    0.600      29.79%   135.03%    26.34%     146.03%
+       24    0.300      18.73%    82.19%    16.71%     127.93%  <- advisory
+       48    0.150      11.23%    48.57%    10.06%      90.85%
+       96    0.075       5.20%    25.05%     4.51%      45.42%
+      192    0.037       0.00%     0.00%     0.00%       0.00%
+
+stiff-lambda: mu = 2112 Pa   lambda = 1592053 Pa  rho = 1014.4   lambda/mu = 754
+  advisory at safety=0.3: 106 substeps/frame (117.9 us);  60 frames, seed 1
+
+  n_sub    substep   safety  peak stretch  max|J-1|  peak disp   KE final    wall
+     26    480.8us    1.223      DIVERGED                         1.1s   (frame 1/60)
+     53    235.8us    0.600       1.16448    0.0311    6.72mm  4.807e-03   11.2s
+    106    117.9us    0.300       1.11837    0.0298    5.77mm  2.714e-03   13.1s
+    212     59.0us    0.150       1.08410    0.0270    4.85mm  1.631e-03   17.1s
+    424     29.5us    0.075       1.05889    0.0227    4.03mm  9.225e-04   25.1s
+    848     14.7us    0.037       1.03692    0.0184    3.35mm  5.311e-04   40.6s
+
+    n_sub   safety   field err     horiz      vert  d(stretch)
+       53    0.600     100.82%   151.44%    93.19%     345.46%
+      106    0.300      67.22%   103.19%    61.71%     220.58%  <- advisory
+      212    0.150      40.33%    68.55%    35.65%     127.76%
+      424    0.075      18.18%    33.11%    15.55%      59.50%
+      848    0.037       0.00%     0.00%     0.00%       0.00%
+```
+
+169.9 s wall for the pair.
+
+#### What the stability half confirms
+
+**The P-wave bound does its stability job, at both materials.** The only rows
+that diverged are the ones above `safety ≈ 1.2` — n=6 for the soft material
+(frame 3 of 60) and n=26 for the stiff one (frame 1 of 60). Everything at
+`safety ≤ 0.6` completed 60 frames with finite `F`. The bound is not decorative,
+and the safety margin of 0.3 buys a factor of four below the observed cliff.
+
+Note also that `max|J-1|` is **0.187 for the soft material and 0.030 for the
+stiff one** — the λ/μ = 754 material resists volume change 6× harder, exactly as
+a near-incompressible material should. Unprompted physical sanity, from a
+quantity nothing in the study was tuning.
+
+#### What does not converge, and why refining will not fix it
+
+Every quantity moves monotonically with refinement and none of them settles.
+Peak stretch above rest falls from 0.169 to 0.074 (soft) and 0.118 to 0.037
+(stiff) — factors of **2.3 and 3.2** — across a 8× substep refinement, with no
+sign of a plateau. Field error at the advisory is 18.7% and 67.2%.
+
+An earlier draft of this section blamed the floor friction. `Boundary()` applies
+
+```python
+if I[2] <= 3:
+    F_grid_v[I][0] *= 0.1
+    F_grid_v[I][1] *= 0.1
+```
+
+— a **per-substep multiplicative tangential damping with no `dt` scaling**
+(`mpm3d.py:274-276`), so the time in which lateral motion is arrested is
+proportional to the substep. That is a genuine defect in the vendored solver and
+it is real. **It is not the main cause here, and the study was made to say so.**
+Splitting the field error into horizontal and vertical components was added
+specifically to test the attribution, because the damping touches `[0]` and `[1]`
+and never `[2]`. The soft material's *vertical* error (16.71%) is comparable to
+its total and its horizontal error is larger, but the stiff material's vertical
+error is 61.71% — far too large to be explained by a term that never touches z.
+The hypothesis survived contact with one column and died against the other.
+
+The actual cause is **numerical dissipation in the particle-grid transfers**, and
+the probe that identifies it is kinetic energy at a fixed simulated time:
+
+| | soft-λ | stiff-λ |
+|---|---|---|
+| KE at coarsest surviving row | 1.208e-1 | 4.807e-3 |
+| KE at finest row | 4.077e-4 | 5.311e-4 |
+| ratio across the sweep | **296×** | **9×** |
+
+Both fall **monotonically**. MPM's P2G/G2P round trip is a projection onto the
+grid basis and loses energy every time it happens; the loss is per *transfer*,
+not per unit of simulated time. Halving the substep doubles the number of
+transfers inside the same 12.5 ms frame and therefore roughly doubles the
+damping. Refining `dt` does not approach a solution — it walks steadily toward an
+over-damped one. That is why the tissue deforms *less* at every refinement rather
+than converging on an amount.
+
+**So the classical instrument does not apply.** "Refine `dt` until the answer
+stops changing" assumes the discretisation error vanishes as `dt → 0` with
+everything else held fixed. In MPM at a fixed grid, it does not: `dx` sets the
+dissipation per transfer, and shrinking `dt` alone only buys more transfers. A
+genuine MPM convergence study must refine `dx` and `dt` **together**, which is a
+different and much more expensive experiment, and one that changes the particle
+count and therefore the schema.
+
+#### The consequence that actually matters for the dataset
+
+**`safety_strain` is not a material property under this solver.** It varies by a
+factor of 2.3–3.2 with a choice of substep that no downstream consumer can see.
+Worse, the collector assigns substeps *per material*, so the two episodes in
+`data_mpm/` were integrated at 24 and 106 substeps per frame — meaning their
+`safety_strain` values carry different amounts of numerical damping and **are not
+comparable to each other**. A model conditioned on material and trained to
+predict deformation would be fitting the substep schedule as much as the tissue.
+
+That is a dataset-design finding, not a solver bug, and it is the most valuable
+thing this study produced. It does not have a fix inside the current
+architecture; it has to be recorded and carried.
+
+#### What changed as a result
+
+**Nothing about `safety = 0.3`.** It is retained, now on its actual grounds:
+it is a *stability* bound with a measured factor-of-four margin below the
+divergence cliff, and it was never a convergence claim. The study's contribution
+is that this is now stated rather than assumed, and that the alternative reading
+has been ruled out rather than left open.
+
+`check_substep_is_stable_for_stiffness` keeps its wording — "passing means not
+obviously unstable, not converged" was exactly right — and now cites §9.6 for
+what convergence turned out to mean.
+
+#### Two things the study got wrong first, kept because they are the method
+
+- **The floor-friction attribution**, above. A plausible mechanism, found by
+  reading the source, that the data refused. The horizontal/vertical split
+  exists because of it and stays in the tool.
+- **A magnitude threshold for the dissipation verdict.** The first version
+  reported transfer dissipation when KE fell more than 10× across the sweep.
+  The two materials fall 296× and 9×, showing *identical* behaviour, so the
+  cutoff told the stiff material to "extend the sweep downward" — advice that
+  would have burned GPU time indefinitely on a sweep that cannot converge. The
+  test is now **monotonicity**, which is scale-free and was right for both.
+
+#### Verification
+
+```
+pytest tests/ -q                                   249 passed
+python host/substep_study.py --frames 60           169.9s, both materials
+python host/validate_dataset.py --data <kept>/     24 passed, 0 failed (exit 0)
+```
+
+The third is the one worth noting: the study's own advisory-row episodes are
+real v2.1 files that pass the full validator, which is the evidence that it
+drove the collector rather than a lookalike copy of its drive loop.
+
+Also asserted inside the study, not merely assumed: every row starts from an
+identical particle cloud. If Taichi's seeding ever changes, that comparison
+becomes meaningless and the study now fails loudly instead of quietly comparing
+different lumps of material.
+
+#### Still open
+
+- **§4 remains untouched.** `container/timestep_study.py` has still never run;
+  the Docker daemon was not running on this machine. That study asks the same
+  question of PyBullet, where the classical instrument *does* apply, because
+  PyBullet's soft body has no particle-grid transfer.
+- **A real MPM convergence study** — refining `dx` and `dt` together — has not
+  been attempted and would change the particle count.
+- **The `*= 0.1` floor friction is still a defect** in the vendored solver, now
+  documented. It is not the dominant error here but it is dt-dependent and
+  should be fixed or replaced with a dt-scaled law before anything depends on
+  lateral behaviour near the floor. `third_party/PROVENANCE.md` records that the
+  tree is unmodified; fixing this means editing it and saying so there.
+
+---
 ## 10. Files
 
 Every path below was checked against the repository on 17 August 2026.
@@ -1294,6 +1509,7 @@ copy is the shareable view, not the only copy.
 | `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
 | `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
 | `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5 |
+| `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run** |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |

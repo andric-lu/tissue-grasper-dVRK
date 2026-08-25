@@ -125,6 +125,7 @@ class MPMRecorder:
         action_spec: str = "delta_pose_jaw",
         frame_dt: float = 0.0125,
         substep_safety: float = 0.3,
+        n_substeps: Optional[int] = None,
         notes: str = "",
     ):
         import MPM.mpm3d as mpm3d          # imports run ti.init() -- see 9.4
@@ -143,16 +144,36 @@ class MPMRecorder:
         # max_principal_stretch refused to converge. That is the failure mode
         # check_substep_is_stable_for_stiffness was written to predict, and it
         # predicted it correctly.
-        self.substep_dt = float(materials.suggested_substep_dt(
+        #
+        # UNLESS THE CALLER NAMES A COUNT. `n_substeps` overrides the advisory,
+        # which is what host/substep_study.py needs: a convergence study has to
+        # VARY the thing the advisory computes, holding the material fixed. It
+        # is not for collection -- passing it there discards the per-material
+        # bound this whole path exists to apply. The advisory is still computed
+        # either way, so `implied_safety` can report where the override sits
+        # relative to it.
+        advisory_dt = float(materials.suggested_substep_dt(
             self.mu, self.rho, mpm3d.dx * DOMAIN_SCALE_M,
             safety=substep_safety, lam=self.lam))
-        # Whole substeps per recorded frame, so the recorded dt stays a round
-        # number the whole dataset shares regardless of material. Episodes with
-        # different stiffness then differ in COST, not in sampling rate -- a
-        # dataset whose dt varies per episode is one a dynamics model cannot use.
-        self.n_substeps = max(1, int(np.ceil(frame_dt / self.substep_dt)))
+        self.advisory_substep_dt = advisory_dt
+
+        if n_substeps is None:
+            # Whole substeps per recorded frame, so the recorded dt stays a
+            # round number the whole dataset shares regardless of material.
+            # Episodes with different stiffness then differ in COST, not in
+            # sampling rate -- a dataset whose dt varies per episode is one a
+            # dynamics model cannot use.
+            self.n_substeps = max(1, int(np.ceil(frame_dt / advisory_dt)))
+        else:
+            if int(n_substeps) < 1:
+                raise ValueError(f"n_substeps must be >= 1, got {n_substeps}")
+            self.n_substeps = int(n_substeps)
         self.substep_dt = frame_dt / self.n_substeps
         self.frame_dt = float(frame_dt)
+        # Where this substep sits relative to the P-wave bound, as the safety
+        # factor that would have produced it. Reported rather than enforced:
+        # the study's whole job is to run rows on both sides of 0.3.
+        self.implied_safety = substep_safety * (self.substep_dt / advisory_dt)
 
         # THE TIMEBASE INVARIANT, asserted where it is established. Every
         # recorded frame must advance the solver by exactly frame_dt, so
@@ -285,7 +306,12 @@ class MPMRecorder:
                 f"rho={self.rho:.1f} kg/m^3 applied as p_mass={self.m.p_mass:.6e} kg, "
                 f"domain_scale={DOMAIN_SCALE_M} m, "
                 f"substep {self.substep_dt*1e6:.1f} us x {self.n_substeps} "
-                f"(P-wave advisory, safety={substep_safety})"),
+                + (f"(P-wave advisory, safety={substep_safety})"
+                   if n_substeps is None else
+                   f"(n_substeps FORCED to {self.n_substeps}; P-wave advisory "
+                   f"was {self.advisory_substep_dt*1e6:.1f} us at "
+                   f"safety={substep_safety}, so this is safety="
+                   f"{self.implied_safety:.4f})")),
             # [log(mu), log(lambda), rho] -- the layout materials.unpack_material
             # expects. Logs because tissue stiffness spans orders of magnitude
             # and a network fed raw Pascals burns capacity on the exponent.
@@ -425,24 +451,40 @@ class MPMRecorder:
 
 # --------------------------------------------------------------------------
 
+def sample_episode_material(seed: int):
+    """The (mu, lambda, rho) an episode seed produces. Shared so a caller that
+    needs to hold the material FIXED while varying something else -- the
+    convergence study -- gets exactly what collection would have used, rather
+    than a lookalike drawn a different way."""
+    rng = np.random.default_rng(seed)
+    # Sample mu and lambda DIRECTLY, log-uniformly. Never (E, nu): lambda is
+    # singular at nu = 0.5 and tissue sits at nu ~ 0.49. See materials.py.
+    mat = materials.sample_material(rng)
+    return float(np.exp(mat[0])), float(np.exp(mat[1])), float(mat[2])
+
+
 def record_episode(path: str, *, n_steps: int = 100, seed: int = 0,
-                   n_record: int = DEFAULT_N_RECORD, quiet: bool = False) -> str:
+                   n_record: int = DEFAULT_N_RECORD, quiet: bool = False,
+                   material=None, n_substeps: Optional[int] = None) -> str:
     """One passive episode: tissue released under gravity, no tool.
 
     Passive because there is no robot yet (see the module docstring). It still
     exercises every part of the path -- large deformation, contact with the
     floor, metrics, subset bookkeeping, the writer -- which is what makes it
     useful before the PSM lands.
+
+    `material` and `n_substeps` exist for host/substep_study.py, which must vary
+    the substep while holding everything else identical. Collection passes
+    neither: the material comes from the seed and the substep from the P-wave
+    advisory, which is the entire point of both.
     """
-    rng = np.random.default_rng(seed)
-    # Sample mu and lambda DIRECTLY, log-uniformly. Never (E, nu): lambda is
-    # singular at nu = 0.5 and tissue sits at nu ~ 0.49. See materials.py.
-    mat = materials.sample_material(rng)
-    mu, lam, rho = float(np.exp(mat[0])), float(np.exp(mat[1])), float(mat[2])
+    mu, lam, rho = sample_episode_material(seed) if material is None \
+        else (float(material[0]), float(material[1]), float(material[2]))
 
     t0 = time.time()
     with MPMRecorder(path, task="tissue_settle", mu=mu, lam=lam, rho=rho,
-                     n_record=n_record, seed=seed) as rec:
+                     n_record=n_record, seed=seed,
+                     n_substeps=n_substeps) as rec:
         # A zero delta-pose action is a real action ("hold still"), not a
         # placeholder, so action_spec="delta_pose_jaw" is honest here.
         ee_pose = np.array([0.25, 0.35, 0.20, 0, 0, 0, 1], np.float32)

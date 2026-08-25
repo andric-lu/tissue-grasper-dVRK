@@ -349,8 +349,19 @@ def check_substep_is_stable_for_stiffness(tr) -> Result:
                             f"lambda={float(lam):.0f} Pa ({dx_note}). "
                             f"lambda/mu={float(lam)/float(mu):.0f}: this is the "
                             "pressure wave, not the shear wave")
-    # Passing means "not obviously unstable", not "converged". Only a timestep
-    # study establishes the latter, which is what section 4 is still open about.
+    # Passing means "not obviously unstable", not "converged". That wording was
+    # right, and section 9.6 established what it costs: the substep study found
+    # the P-wave bound IS a good stability bound -- the only rows that diverged
+    # were above safety ~1.2, so 0.3 carries a factor-of-four margin -- but that
+    # nothing here converges under substep refinement, because MPM's
+    # particle-grid transfers dissipate per transfer rather than per unit of
+    # simulated time. Refining dt at fixed dx over-damps instead of converging.
+    # The practical consequence for anything reading this file: safety_strain is
+    # NOT a material property under this solver. It moved by a factor of 2.3-3.2
+    # across an 8x substep refinement, and the collector assigns substeps per
+    # material, so two episodes with different stiffness carry different amounts
+    # of numerical damping. Section 4 remains open for PyBullet, where the
+    # classical refinement argument does apply.
     return Result(PASS, f"substep {actual*1e6:.1f} us vs P-wave advisory "
                         f"{advised*1e6:.1f} us (ratio {ratio:.2f}, {dx_note}, "
                         f"lambda/mu={float(lam)/float(mu):.0f})")
