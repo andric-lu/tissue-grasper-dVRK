@@ -23,12 +23,23 @@ enough that you need partial/streaming reads, swap the two functions at the bott
 for h5py equivalents -- nothing else in your codebase should have to change.
 
 WHEN TO ACTUALLY MAKE THAT SWAP: `tissue_F` is the trigger. It is nine floats per
-particle per step, which dwarfs everything else in the file. At MPM scale --
-10,000 particles x 400 steps x 9 floats x 4 bytes -- that is ~144 MB per episode
-for the deformation gradient alone, before compression and before the other
-fields. A thousand-episode dataset is then measured in hundreds of gigabytes and
-must be read lazily. `store_F_as_float16=True` halves it as a stopgap; when
-halving is no longer enough, move to h5py.
+particle per step, which dwarfs everything else in the file. Measured against
+real MPM output (24,000 particles, J down to 0.55): 79.3 MB per 100 recorded
+steps for the deformation gradient alone. A 300-step episode is 238 MB and 200
+of them is 48 GB.
+
+Do not expect compression to rescue this. `savez_compressed` recovers **8.3%**
+on float32 physics data -- the low mantissa bits are noise and zlib cannot model
+them. The size has to come out of the data, not out of the encoder.
+
+Two knobs do that, and they compose (see `f_encoding` and `particle_ids` below):
+
+    f_encoding="delta16"     2.0x   quantise F - I, not F
+    record 3000 of 24000     8.0x   the solver's resolution is not the dataset's
+    both                    15.5x   79.3 MB -> 5.1 MB per 100 steps
+
+When 15x is no longer enough, move to h5py -- the two functions at the bottom of
+this file are the only ones that would change.
 
 THE SCHEMA
 ----------
@@ -54,6 +65,24 @@ Static (recorded once per episode):
     target_origin    (3,) float32  centre of the target region to expose
     target_normal    (3,) float32  unit normal of the target plane
     target_extent    (2,) float32  half-extents of the target rectangle, metres
+  -- added in v2.1 --
+    particle_ids     (N,) int32    for each recorded node, its index in the
+                                   SOLVER's full particle array. Empty (0,) means
+                                   "not recorded", which for a mesh solver is the
+                                   normal case: nodes are all the nodes there are.
+    n_particles_simulated int32    how many particles the solver actually stepped.
+                                   0 = not recorded. When this exceeds N, the file
+                                   holds a SUBSET and every per-particle array is
+                                   a sample, not a census. See SUBSETS below.
+    f_encoding       str           how tissue_F is encoded ON DISK; the reader
+                                   always hands back float32 F. See F ENCODINGS.
+    grid_dx          float32       solver grid spacing, metres. 0.0 = not
+                                   recorded. Stability advisories scale linearly
+                                   with it, so a validator that has to ASSUME a
+                                   value is off by whatever ratio it guessed
+                                   wrong -- and it will guess wrong, because dx
+                                   is a property of the solver, not of the
+                                   universe. Record it.
 
 Per-step (T = number of steps, N = number of tissue nodes/particles):
     tissue_pos       (T,N,3) float32   node positions, metres, world frame
@@ -78,6 +107,63 @@ Grasped node indices vary in length per step, so they are stored CSR-style:
     grasp_ids_flat    (sum_of_lengths,) int32
     grasp_ids_offset  (T+1,) int32      step t's ids = flat[offset[t]:offset[t+1]]
 
+F ENCODINGS
+-----------
+`f_encoding` describes the bytes on disk. Every reader gets float32 F back
+regardless, so nothing downstream branches on it.
+
+    "float32"   (T,N,3,3) float32. Lossless, the default, 79.3 MB/100 steps.
+    "float16"   (T,N,3,3) float16 of F itself. Halves it.
+    "delta16"   (T,N,3,3) float16 of H = F - I. Halves it, and is far more
+                accurate than "float16" for the same bytes.
+
+WHY "delta16" BEATS "float16" AT IDENTICAL SIZE: float16 spacing is not uniform.
+Near 1.0 it is ~9.8e-4, so storing F itself throws away exactly the small strains
+-- a 0.1% stretch is not representable at all. Near 0.0 the spacing falls to
+~6e-8. The undeformed state is F = I, so subtracting I moves the whole dataset
+into the precise part of the number line. Measured on real MPM output:
+
+                     max err in J     in max principal stretch
+    "float16"           1.5e-3                4.9e-4
+    "delta16"           1.4e-4                3.1e-5
+
+`validate_dataset.py` recomputes the logged metrics to a tolerance of 1e-3, so
+"float16" lands at half the tolerance while "delta16" sits 32x below it. Prefer
+"delta16"; "float16" is kept because v2.0 files were written with it.
+
+CAUTION IF YOU np.load A FILE BY HAND: under "delta16" the array stored at key
+`tissue_F` holds F - I, not F. `load_trajectory` reconstructs it. Reading the
+raw npz and forgetting that gives you a deformation gradient centred on zero,
+which is not a deformation gradient at all -- check `f_encoding` first.
+
+SUBSETS: THE SOLVER'S RESOLUTION IS NOT THE DATASET'S
+-----------------------------------------------------
+An MPM needs enough particles for stable physics (~24,000 here); a graph network
+needs few enough to train (MeshGraphNets runs 1.5k-5k nodes). These are different
+numbers and conflating them makes the dataset infeasible for the model long
+before it is inconvenient for the disk. So a writer may record a fixed SUBSET of
+particles, naming them in `particle_ids` and the full count in
+`n_particles_simulated`.
+
+The subset must be FIXED for the whole episode. Node identity has to be stable
+across time or consecutive frames describe different particles, which is
+meaningless for a dynamics model and silently wrong rather than loud.
+
+THE TRAP, AND THE RULE THAT AVOIDS IT: `safety_strain` is a MAXIMUM over
+particles, and a maximum over a subset is biased low by construction. Measured:
+recording 3,000 of 24,000 particles underestimated peak stretch by 8% of the
+stretch above rest, and erratically -- one random 6,000-particle draw missed the
+worst particle while a 3,000-particle draw happened to catch it. A safety number
+that reads low because you stored less data is the worst failure available here.
+
+    RULE: compute `exposure` and `safety_strain` over ALL simulated particles,
+    at collection time, and log the scalars. Never over the stored subset.
+
+This costs nothing -- the full state is already in memory when the metrics are
+computed -- and it is exactly why the schema logs metrics that are otherwise
+derivable. `validate_dataset.py` knows about subsets and checks the logged value
+with an inequality rather than an equality.
+
 READING v1 FILES
 ----------------
 v1 files load without error. Fields introduced in v2 come back as EMPTY arrays,
@@ -101,13 +187,50 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 # Every version this reader knows how to turn into a v2-shaped Trajectory.
 # A file claiming anything else cannot be interpreted safely, and guessing is
 # worse than stopping: silently misreading a field is how a whole training run
 # gets thrown away a week later.
-KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0")
+KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0", "2.1")
+
+# How tissue_F may be laid out on disk. The reader normalises all of these to
+# float32 F, so this never leaks past load_trajectory(). See F ENCODINGS above.
+F_ENCODINGS = ("float32", "float16", "delta16")
+
+# The undeformed deformation gradient. "delta16" stores F - I so that the
+# quantisation error lands where float16 is precise (near 0) instead of where
+# it is coarse (near 1). Defined once so the encoder and decoder cannot drift.
+_IDENTITY_3 = np.eye(3, dtype=np.float32)
+
+
+def _encode_F(F: Optional[np.ndarray], encoding: str) -> np.ndarray:
+    """(T,N,3,3) float32 deformation gradients -> the array to put on disk."""
+    if F is None or F.size == 0:
+        # Empty means "this solver has no F". Kept float32 so that a file with
+        # no deformation gradient never looks like a quantised one.
+        return np.zeros(0, np.float32)
+    F = np.asarray(F, np.float32)
+    if encoding == "float32":
+        return F
+    if encoding == "float16":
+        return F.astype(np.float16)
+    if encoding == "delta16":
+        return (F - _IDENTITY_3).astype(np.float16)
+    raise ValueError(f"unknown f_encoding {encoding!r}")
+
+
+def _decode_F(arr: np.ndarray, encoding: str) -> np.ndarray:
+    """The inverse of `_encode_F`. Always returns float32, whatever went in."""
+    if arr.size == 0:
+        return arr.astype(np.float32, copy=False)
+    if encoding == "delta16":
+        # Upcast BEFORE adding I: doing it in float16 would round the sum back
+        # to float16 spacing near 1.0 and throw away precisely the precision
+        # this encoding exists to preserve.
+        return arr.astype(np.float32) + _IDENTITY_3
+    return arr.astype(np.float32, copy=False)
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +298,10 @@ class TrajectoryWriter:
         target_normal: Optional[np.ndarray] = None,
         target_extent: Optional[np.ndarray] = None,
         store_F_as_float16: bool = False,
+        f_encoding: Optional[str] = None,
+        particle_ids: Optional[np.ndarray] = None,
+        n_particles_simulated: int = 0,
+        grid_dx: float = 0.0,
     ):
         # Everything added in v2 is keyword-only. The four leading positional
         # arguments are kept positional because callers already pass them that
@@ -208,11 +335,54 @@ class TrajectoryWriter:
         self.target_extent = _as(target_extent, np.float32, (2,)) \
             if target_extent is not None else np.zeros(0, np.float32)
 
-        # float16 is a STORAGE format, not a compute format: the reader upcasts
-        # it back to float32. Be aware of what it costs. Near F = I the spacing
-        # of float16 is ~1e-3, so a 0.1% stretch is not representable at all.
-        # Fine for logging large deformation, wrong for small-strain analysis.
-        self.store_F_as_float16 = bool(store_F_as_float16)
+        # How F is laid out on disk. This is a STORAGE choice, not a compute
+        # one: the reader hands back float32 whichever branch is taken here.
+        #
+        # `store_F_as_float16` predates `f_encoding` and is kept because v2.0
+        # files and src/synthetic_traj.py both use it. The two are not allowed
+        # to disagree -- silently honouring one and ignoring the other is how a
+        # dataset ends up encoded differently from what its caller believes.
+        if f_encoding is None:
+            f_encoding = "float16" if store_F_as_float16 else "float32"
+        elif store_F_as_float16 and f_encoding != "float16":
+            raise ValueError(
+                f"store_F_as_float16=True conflicts with f_encoding={f_encoding!r}. "
+                "Pass only f_encoding; the bool is the older spelling of "
+                "f_encoding='float16'.")
+        if f_encoding not in F_ENCODINGS:
+            raise ValueError(f"f_encoding must be one of {F_ENCODINGS}, "
+                             f"got {f_encoding!r}")
+        self.f_encoding = f_encoding
+        self.store_F_as_float16 = (f_encoding == "float16")
+
+        # A subset record names the particles it kept. Empty means "these are
+        # all the particles there are", which is the normal case for a mesh
+        # solver and for any MPM run that records everything.
+        self.particle_ids = _as(particle_ids, np.int32, (-1,)) \
+            if particle_ids is not None else np.zeros(0, np.int32)
+        self.n_particles_simulated = int(n_particles_simulated)
+        # Zero is unambiguous: a solver cannot have zero grid spacing, so 0.0
+        # reads as "not recorded" without colliding with a real measurement.
+        self.grid_dx = float(grid_dx)
+        if self.grid_dx < 0.0:
+            raise ValueError(f"grid_dx must be positive or 0 (not recorded), "
+                             f"got {self.grid_dx}")
+
+        # Caught here rather than at close(), because the caller that built a
+        # bad index set is on the stack right now and will not be later.
+        if self.particle_ids.size:
+            if np.any(self.particle_ids < 0):
+                raise ValueError("particle_ids contains negative indices")
+            if np.unique(self.particle_ids).size != self.particle_ids.size:
+                raise ValueError(
+                    "particle_ids contains duplicates: the same solver particle "
+                    "would be recorded as two independent nodes, inflating the "
+                    "node count with perfectly correlated data.")
+            if self.n_particles_simulated and \
+                    self.particle_ids.max() >= self.n_particles_simulated:
+                raise ValueError(
+                    f"particle_ids max is {int(self.particle_ids.max())} but only "
+                    f"{self.n_particles_simulated} particles were simulated")
 
         # Per-step buffers.
         self._pos, self._vel = [], []
@@ -373,14 +543,31 @@ class TrajectoryWriter:
                 f"boundary_mask has {self.boundary_mask.size} entries but the "
                 f"episode has {self._n_nodes} nodes")
 
-        # float16 on disk, always float32 in memory (see the reader).
-        F_dtype = np.float16 if self.store_F_as_float16 else np.float32
-        tissue_F = np.stack(self._F).astype(F_dtype, copy=False) if self._F \
-            else np.zeros(0, F_dtype)
+        # particle_ids arrives before any append, so like boundary_mask its
+        # length can only be checked once the node count is known.
+        if self.particle_ids.size and self.particle_ids.size != self._n_nodes:
+            raise ValueError(
+                f"particle_ids names {self.particle_ids.size} particles but the "
+                f"episode recorded {self._n_nodes} nodes")
+        if self.n_particles_simulated and self.n_particles_simulated < self._n_nodes:
+            raise ValueError(
+                f"n_particles_simulated={self.n_particles_simulated} is fewer than "
+                f"the {self._n_nodes} nodes recorded; a subset cannot be larger "
+                "than the set it came from")
+
+        # Encoded on disk, always float32 in memory (see the reader). Under
+        # "delta16" what lands in the file is F - I, which is why f_encoding is
+        # written alongside it -- the bytes alone do not say which it is.
+        tissue_F = _encode_F(np.stack(self._F) if self._F else None,
+                             self.f_encoding)
 
         np.savez_compressed(
             self.path,
             schema_version=SCHEMA_VERSION,
+            f_encoding=self.f_encoding,
+            particle_ids=self.particle_ids,
+            n_particles_simulated=np.int32(self.n_particles_simulated),
+            grid_dx=np.float32(self.grid_dx),
             simulator=self.simulator,
             task=self.task,
             dt=np.float32(self.dt),
@@ -457,17 +644,40 @@ class Trajectory:
         """
         return int(self._d["tissue_F"].size) > 0
 
+    @property
+    def is_subset(self) -> bool:
+        """True when the file records fewer particles than the solver stepped.
+
+        Anything computing a MAXIMUM over particles must branch on this: a max
+        over a subset is biased low, so the stored per-particle arrays cannot
+        reproduce the logged `safety_strain`. They are not supposed to -- see
+        SUBSETS in the module docstring -- but code that assumes they can will
+        report a safety violation that is really a sampling artefact.
+        """
+        n_sim = int(self._d["n_particles_simulated"])
+        return n_sim > 0 and n_sim > self.n_nodes
+
+    @property
+    def subset_fraction(self) -> float:
+        """Recorded particles / simulated particles. 1.0 when nothing was dropped."""
+        n_sim = int(self._d["n_particles_simulated"])
+        return 1.0 if n_sim <= 0 else self.n_nodes / n_sim
+
     def grasp_ids(self, t: int) -> np.ndarray:
         """Node indices grasped at step t (variable length)."""
         off = self._d["grasp_ids_offset"]
         return self._d["grasp_ids_flat"][off[t]:off[t + 1]]
 
     def __repr__(self) -> str:
+        sub = f" {self.n_nodes}/{int(self._d['n_particles_simulated'])}" \
+            if self.is_subset else ""
+        enc = self._d.get("f_encoding", "float32")
         return (f"<Trajectory {os.path.basename(self.path)} "
                 f"sim={self._d['simulator']} task={self._d['task']} "
                 f"v{self._d['schema_version']} "
-                f"steps={len(self)} nodes={self.n_nodes} dt={float(self._d['dt']):.5f}"
-                f"{' +F' if self.has_F else ''}>")
+                f"steps={len(self)} nodes={self.n_nodes}{sub} "
+                f"dt={float(self._d['dt']):.5f}"
+                f"{f' +F[{enc}]' if self.has_F else ''}>")
 
 
 def load_trajectory(path: str) -> Trajectory:
@@ -475,7 +685,8 @@ def load_trajectory(path: str) -> Trajectory:
     with np.load(path, allow_pickle=False) as z:
         d = {k: z[k] for k in z.files}
     # numpy stores strings as 0-d arrays; unwrap them so they behave like str.
-    for k in ("schema_version", "simulator", "task", "notes", "action_spec"):
+    for k in ("schema_version", "simulator", "task", "notes", "action_spec",
+              "f_encoding"):
         if k in d:
             d[k] = str(d[k])
 
@@ -511,6 +722,11 @@ def _upgrade_in_place(d: dict) -> None:
         "contact_mode": np.int8,
         "exposure": np.float32,
         "safety_strain": np.float32,
+        # v2.1. Empty particle_ids is the honest reading for every older file:
+        # they recorded whatever they recorded and never said how it related to
+        # a solver's particle array. Zeros would claim they all recorded
+        # particle 0, which is worse than admitting the mapping is unknown.
+        "particle_ids": np.int32,
     }
     for key, dtype in empty.items():
         if key not in d:
@@ -524,11 +740,25 @@ def _upgrade_in_place(d: dict) -> None:
     # Naming it "abs_pose_jaw" would misdescribe both its width and its meaning.
     d.setdefault("action_spec", "unknown")
 
-    # float16 is a storage format only. Upcast on read so every consumer sees
-    # one dtype: numpy.linalg promotes float16 to float64 anyway, and a metric
-    # that silently changes precision with a writer flag is a debugging trap.
-    if d["tissue_F"].dtype == np.float16:
-        d["tissue_F"] = d["tissue_F"].astype(np.float32)
+    # Zero particles simulated, and zero grid spacing, are not physically
+    # meaningful readings, so 0 carries "not recorded" here the same way it
+    # does for n_substeps.
+    d.setdefault("n_particles_simulated", np.int32(0))
+    d.setdefault("grid_dx", np.float32(0.0))
+
+    # v2.0 and earlier had no `f_encoding`; they chose between float32 and
+    # float16 and left the dtype to say which. Inferring from the dtype
+    # reproduces that exactly. No older file can be "delta16", because nothing
+    # could write one -- so this inference is complete, not a guess.
+    if "f_encoding" not in d:
+        d["f_encoding"] = "float16" if d["tissue_F"].dtype == np.float16 \
+            else "float32"
+
+    # The encoding is a storage detail only. Decode on read so every consumer
+    # sees float32 F: numpy.linalg promotes float16 to float64 anyway, and a
+    # metric that silently changes precision with a writer flag is a debugging
+    # trap. After this line `tissue_F` is F, never F - I.
+    d["tissue_F"] = _decode_F(d["tissue_F"], d["f_encoding"])
 
     # `schema_version` is deliberately NOT rewritten to SCHEMA_VERSION. It
     # describes the file on disk, and a validator reporting "this v1 episode has
@@ -696,5 +926,71 @@ if __name__ == "__main__":
         except ValueError as e:
             assert "boundary_mask" in str(e)
 
-        print("OK -- trajectory_io round-trip passed (v1-style and v2, "
-              "float16 F, upgrade path)")
+        # -- 4. v2.1: a subset record with delta16 F -------------------------
+        n_sim, n_rec = 24000, N
+        SMALL = 1.0e-4                      # 0.01% stretch
+        ids = np.linspace(0, n_sim - 1, n_rec).astype(np.int32)
+        r = os.path.join(tmp, "selftest_subset.npz")
+        with TrajectoryWriter(
+                r, "taichi_mpm", "tissue_retraction", 0.0125,
+                f_encoding="delta16",
+                particle_ids=ids, n_particles_simulated=n_sim,
+                material_params=np.array([np.log(3000.0), np.log(1.5e5), 1000.0]),
+                action_spec="delta_pose_jaw") as w:
+            for t in range(T):
+                # A SMALL strain: 0.01% stretch. float16 spacing at 1.0 is
+                # ~9.8e-4, so 1.0001 is below the first representable step
+                # above 1.0 and rounds straight back to it: under "float16"
+                # this deformation does not merely lose precision, it vanishes.
+                F = np.tile(np.diag([1.0 + SMALL, 1.0, 1.0]), (N, 1, 1))
+                w.append(tissue_pos=rng.normal(size=(N, 3)),
+                         ee_pose=np.zeros(7), action=np.zeros(7), tissue_F=F)
+        ts = load_trajectory(r)
+        assert ts.is_subset and ts.n_nodes == n_rec
+        assert int(ts.n_particles_simulated) == n_sim
+        assert abs(ts.subset_fraction - n_rec / n_sim) < 1e-9
+        assert ts.particle_ids.shape == (n_rec,) and ts.f_encoding == "delta16"
+        assert ts.tissue_F.dtype == np.float32
+        # The whole point, demonstrated against the alternative rather than
+        # asserted: delta16 keeps the strain, plain float16 erases it.
+        got = float(ts.tissue_F[0, 0, 0, 0])
+        assert abs(got - (1.0 + SMALL)) < 1e-6, f"delta16 lost a small strain: {got}"
+        naive = float(np.float32(np.float16(np.float32(1.0 + SMALL))))
+        assert naive == 1.0, f"expected float16 to flatten 1+{SMALL} to 1.0, got {naive}"
+        print(ts)
+        print(f"delta16 kept a {SMALL:g} stretch as {got:.8f}; "
+              f"plain float16 flattens it to {naive:.8f} (strain entirely lost)")
+
+        # -- 5. subset bookkeeping the writer must refuse --------------------
+        # Duplicate ids mean one particle recorded as two nodes: perfectly
+        # correlated columns masquerading as independent data.
+        for kwargs, want in (
+            (dict(particle_ids=np.array([0, 1, 1], np.int32)), "duplicate"),
+            (dict(particle_ids=np.array([0, 1, 99], np.int32),
+                  n_particles_simulated=10), "only 10 particles"),
+        ):
+            try:
+                TrajectoryWriter(os.path.join(tmp, "bad3.npz"), "s", "t", 0.01,
+                                 **kwargs)
+                raise AssertionError(f"writer accepted bad particle_ids ({want})")
+            except ValueError as e:
+                assert want in str(e), e
+        # A subset smaller than the set it came from is the only legal ordering.
+        try:
+            with TrajectoryWriter(os.path.join(tmp, "bad4.npz"), "s", "t", 0.01,
+                                  n_particles_simulated=3) as w:
+                w.append(tissue_pos=np.zeros((N, 3)), ee_pose=np.zeros(7),
+                         action=np.zeros(7))
+            raise AssertionError("writer accepted more nodes than particles")
+        except ValueError as e:
+            assert "cannot be larger" in str(e)
+        # The two spellings of the float16 choice must not disagree silently.
+        try:
+            TrajectoryWriter(os.path.join(tmp, "bad5.npz"), "s", "t", 0.01,
+                             store_F_as_float16=True, f_encoding="delta16")
+            raise AssertionError("writer accepted conflicting F encoding flags")
+        except ValueError as e:
+            assert "conflicts" in str(e)
+
+        print("OK -- trajectory_io round-trip passed (v1-style, v2 float16 F, "
+              "v2.1 subset + delta16 F, upgrade path)")

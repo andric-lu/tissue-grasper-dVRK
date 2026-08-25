@@ -8,7 +8,7 @@ records why each one is what it is. Section references below are to that file.
 
 - **Not a computer science major.** Explain what a thing does and why it exists,
   not just what to type. Assume no familiarity with build systems, packaging, or
-  git internals; assume real fluency in the physics and the research.
+  git internals; assume real fluency in the physics and the research. He should be able to explain the CS decisions and implementations in precise detail.
 - **Show the reasoning trace.** He should be able to reproduce the work himself
   afterwards. Name the commands you ran and what their output meant.
 - **Do not jump to the recommended implementation.** Give the alternatives and
@@ -44,6 +44,7 @@ pytest tests/ -q                                    # 200 tests
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
+python host/smoke_test_mpm.py                       # 15 checks, §9.4; ~10s first run
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
@@ -129,20 +130,45 @@ chronological one. Both are in the repo and must stay there.
 - **The MLP is a placeholder.** MeshGraphNets is the target; the schema already
   carries `tissue_faces` / `tissue_tets`.
 
-### Next: MPM
+### MPM — vendored and smoke-tested (§9.4)
 
-SurRoL's `Dev` branch MPM lifts out as four files (`config.py`, `mpm3d.py`,
-`sdf.py`, `requirements.txt`) with no `surrol.*` or `panda3d` imports. Decision
-is to **vendor it at `third_party/MPM/` and record the upstream commit SHA**
-(§9.3). Open, to be settled by a smoke test rather than argument:
+`third_party/MPM/` holds SurRoL's `Dev` MPM, four files, byte-identical to
+upstream at `cb797f36`. `third_party/PROVENANCE.md` has the SHA and checksums;
+update its "Local modifications" section the moment you edit one of them.
 
-1. `ti._lib.core.with_metal()` is a **private** Taichi API; their code pins 1.6.0
-   and the host has 1.7.4. If it moved, the guard fails silently and everything
-   runs on `ti.cpu` — correct physics, wrong speed, no error. Print the backend.
-2. `pybullet` and `scikit-image` are not yet in the host env. PyBullet has no
-   macOS arm64 wheel and compiles from source: 5–8 minutes, no output, not a hang.
-3. `from MPM.config import ...` means the parent directory must be on `sys.path`.
+`host/smoke_test_mpm.py` passes 15/15. All three of §9.3's open questions are
+closed. What it established that you need to know:
 
-Then the adapter: read MPM particle state, write a v2 `.npz`. It is small because
-the receiving end was built first — `F_x → tissue_pos`, `F_v → tissue_vel`,
-`F → tissue_F`, and `set_parameters()` takes what `materials.py` produces.
+- **Runs on Metal, 0.64 ms/substep** (24k particles, 64³ grid, ~0.8× realtime).
+  Metal is **8.1×** faster than the CPU here — verified by forcing the fallback
+  with `TI_ARCH=arm64`, which makes the backend check FAIL as it should. Note
+  `TI_ARCH=cpu` is not a valid name and aborts; the CPU arch is `arm64`.
+- The *first* substep on a fresh machine takes ~10 s compiling kernels, then
+  ~0.5 s once `~/.cache/taichi` is warm. Not a hang. On this project a long
+  silence is usually a compiler — same as PyBullet's build.
+- **`mpm3d.py` calls `ti.init()` at module level.** Importing it *is* the
+  backend decision; nothing downstream can pick an arch.
+- **`third_party/` goes on `sys.path`, not `third_party/MPM/`.** No
+  `__init__.py` — PEP 420 namespace package, which keeps the tree unmodified.
+- **`substep()` needs `SDF` and `collision_mask` bound by hand** if you drive it
+  without a PyBullet scene; `step()` normally rebinds them from `sdf.py`. Fill
+  the SDF large and positive and the collision branch never fires.
+- **PyBullet does not build with a plain `pip install`** on this macOS SDK. Needs
+  `export CFLAGS="-Dfdopen=fdopen" CXXFLAGS="-Dfdopen=fdopen"` first, *before*
+  `conda env create` — a YAML file cannot set it. Reasoning in §9.4.
+
+**`set_parameters()` takes (E, ν), not (μ, λ) — §9.3 got this wrong.** It runs
+`la = E*nu/((1+nu)(1-2nu))` internally, the singular conversion §8.3 exists to
+avoid, defaulting to `s_nu=0.2`. Measured round-trip error is small (2.7e-4) but
+pointless: **the adapter writes `mpm3d.mu[None]` and `mpm3d.la[None]` directly
+and never calls `set_parameters()`.**
+
+### Next: the adapter
+
+Read MPM particle state, write a v2 `.npz`. The mapping is verified, not
+assumed: `F_x → tissue_pos` (N,3), `F_v → tissue_vel` (N,3), `F → tissue_F`
+(N,3,3), all float32, no reshape, and `TrajectoryWriter` already accepts them.
+
+Watch the size. `tissue_F` is 864 KB/frame at 24k particles — a 100-step episode
+is ~86 MB, twenty is ~1.7 GB. `trajectory_io.py`'s `store_F_as_float16` flag was
+written for exactly this trigger and the trigger has now been reached.

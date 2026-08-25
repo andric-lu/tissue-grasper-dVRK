@@ -359,4 +359,18 @@ class TestRunner:
         assert len(names) >= 12
 
     def test_schema_version_constant_is_current(self):
-        assert SCHEMA_VERSION == "2.0"
+        """Bumping the schema must be deliberate, and must not orphan old data.
+
+        This test is a tripwire: it fails the moment SCHEMA_VERSION changes, so
+        the bump cannot happen as a side effect of editing something else. When
+        it fails, the question to answer is not "what is the new string" but
+        "can the reader still open every file already on disk" -- which is why
+        the older versions are asserted here too rather than just the new one.
+        """
+        from trajectory_io import KNOWN_SCHEMA_VERSIONS
+        assert SCHEMA_VERSION == "2.1"
+        assert SCHEMA_VERSION in KNOWN_SCHEMA_VERSIONS
+        # data/ is v1.0 and the synthetic episodes are v2.0. Dropping either
+        # from the reader would strand data that is still on disk.
+        for older in ("1.0", "2.0"):
+            assert older in KNOWN_SCHEMA_VERSIONS

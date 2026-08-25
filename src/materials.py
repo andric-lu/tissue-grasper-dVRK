@@ -41,7 +41,7 @@ numpy 2.x (the host env).
 
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -160,8 +160,23 @@ def unpack_material(params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndar
 # --------------------------------------------------------------------------
 
 def suggested_substep_dt(mu: ArrayLike, rho: ArrayLike, dx: ArrayLike,
-                         safety: float = 0.3) -> np.ndarray:
+                         safety: float = 0.3,
+                         lam: Optional[ArrayLike] = None) -> np.ndarray:
     """Advisory MPM substep, seconds, for a given material and grid spacing.
+
+    PASS `lam` AND YOU GET THE BOUND THAT ACTUALLY HOLDS. Without it this uses
+    the bar-wave speed sqrt(3*mu/rho), which ignores the pressure wave and is
+    therefore an upper bound only -- see KNOWN LIMITATION below. With it the
+    wave speed is sqrt((lambda + 2*mu)/rho), the real P-wave speed, and the
+    result is the step a nearly incompressible material genuinely needs.
+
+    This is not academic. Sampling this module's own default ranges and running
+    the vendored MPM at its fixed 500 us substep: the bar-wave bound called
+    every material safe (1400-5200 us), the P-wave bound called three of six
+    unstable, and the three it flagged were exactly the three that diverged --
+    one of them badly enough that det(F) went non-finite and an SVD inside
+    `max_principal_stretch` refused to converge. lambda/mu reaches ~750 here,
+    so the two bounds differ by a factor of ~16.
 
         c  = sqrt(E / rho)        elastic wave speed
         dt = safety * dx / c      CFL-style bound: no wave crosses a cell in
@@ -178,14 +193,13 @@ def suggested_substep_dt(mu: ArrayLike, rho: ArrayLike, dx: ArrayLike,
     nu -> 0.5). That is the right substitution for tissue and it keeps this
     function's signature free of lambda.
 
-    KNOWN LIMITATION: for a nearly incompressible material lambda >> mu, and
-    the pressure (P-wave) speed sqrt((lambda + 2*mu) / rho) is several times
-    the shear speed used here. With the default ranges lambda/mu reaches ~100,
-    so the true stable step can be ~5x smaller than this returns. Treat the
-    result as an upper bound to start a convergence study from, not as a
-    guarantee -- exactly as container/timestep_study.py exists to do for the
-    PyBullet side. Nothing in the current codebase calls this in anger; the MPM
-    collector will.
+    KNOWN LIMITATION (applies only when `lam` is omitted): for a nearly
+    incompressible material lambda >> mu, and the pressure (P-wave) speed
+    sqrt((lambda + 2*mu) / rho) is several times the bar speed used here. With
+    the default ranges lambda/mu reaches ~750, so the true stable step can be an
+    order of magnitude smaller than this returns. Treat the lam-less result as
+    an upper bound to start a convergence study from, not as a guarantee --
+    exactly as container/timestep_study.py exists to do for the PyBullet side.
     """
     mu = np.asarray(mu, np.float64)
     rho = np.asarray(rho, np.float64)
@@ -195,7 +209,13 @@ def suggested_substep_dt(mu: ArrayLike, rho: ArrayLike, dx: ArrayLike,
             f"mu, rho and dx must all be positive; got mu={mu}, rho={rho}, dx={dx}")
     if not 0.0 < safety <= 1.0:
         raise ValueError(f"safety must be in (0, 1], got {safety}")
-    c = np.sqrt(3.0 * mu / rho)
+    if lam is None:
+        c = np.sqrt(3.0 * mu / rho)          # bar wave, E = 3*mu
+    else:
+        lam = np.asarray(lam, np.float64)
+        if np.any(lam <= 0):
+            raise ValueError(f"lam must be positive when given; got lam={lam}")
+        c = np.sqrt((lam + 2.0 * mu) / rho)  # P wave -- the one that bites
     return safety * dx / c
 
 

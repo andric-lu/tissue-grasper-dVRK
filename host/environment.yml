@@ -66,6 +66,39 @@ dependencies:
     # package is a concrete reason the host side has to exist.
     - taichi==1.7.4
 
+    # ---------------------------------------------------------------------
+    # The two dependencies of the vendored MPM (third_party/MPM/).
+    #
+    # scikit-image ships an arm64 wheel and needs nothing special. PyBullet
+    # does NOT: there is no macOS arm64 wheel, so pip builds it from source,
+    # which takes 5-8 minutes and prints almost nothing. That is not a hang.
+    #
+    # AND IT DOES NOT BUILD WITH A PLAIN `pip install`. PyBullet vendors a
+    # very old zlib whose zutil.h does:
+    #
+    #     #ifndef fdopen
+    #     #define fdopen(fd, mode) NULL   /* No fdopen() */
+    #     #endif
+    #
+    # gzguts.h then includes the system <stdio.h>, and that macro rewrites the
+    # SDK's real declaration of fdopen into `FILE *((void*)0)(int, ...)`:
+    #
+    #     _stdio.h:322:7: error: expected identifier or '('
+    #
+    # The guard is `#ifndef fdopen`, not zlib's later `#ifndef HAVE_FDOPEN`,
+    # so -DHAVE_FDOPEN does nothing. Defining the macro to itself does: C does
+    # not rescan a macro that expands to its own name, so `fdopen` stays
+    # `fdopen` and the bad #define is skipped. Export this BEFORE creating or
+    # updating the environment:
+    #
+    #     export CFLAGS="-Dfdopen=fdopen" CXXFLAGS="-Dfdopen=fdopen"
+    #     conda env create -f host/environment.yml
+    #
+    # Full reasoning in DECISION_LOG.md 9.4. Built pybullet 3.2.7 this way on
+    # 17 Aug 2026; the resulting wheel is cached, so this is a one-time cost.
+    - pybullet
+    - scikit-image
+
     # Notebooks are the right tool for inspecting trajectories.
     - jupyterlab
 
