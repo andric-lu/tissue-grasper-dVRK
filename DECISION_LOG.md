@@ -976,6 +976,283 @@ starts from a verified mapping, a known-good parameter interface, and a solver
 that has actually run.
 
 ---
+
+### 9.5 The adapter: four bugs, three of them invisible
+
+25 August 2026. `host/mpm_adapter.py` reads MPM particle state and writes a v2.1
+episode. The adapter itself is small, as §9.3 predicted. What was not predicted
+is that writing it would expose four defects, three of which produced data that
+was **internally consistent and physically wrong** — the failure mode this
+project's entire validation discipline exists to catch, arriving all at once.
+
+Verified at the end of this section: **249 tests pass**, `trajectory_io.py`'s
+self-test passes, `smoke_test_mpm.py` is **16/16 on Metal**, and two fresh
+100-step episodes validate with **0 FAIL**.
+
+#### What the adapter does
+
+`MPMRecorder`, one instance per episode. It samples a material, writes μ and λ
+straight into `mpm3d.mu[None]` / `mpm3d.la[None]` (never `set_parameters()` —
+§9.4), chooses a substep from the material, drives `substep()` directly with a
+hand-bound SDF so no PyBullet scene is needed, and appends frames through
+`TrajectoryWriter`. Four rules from CLAUDE.md meet their first real consumer
+here, and they are recorded in the module docstring rather than only here.
+
+**Schema 2.1** carries what 2.0 could not:
+
+- `f_encoding`, with **`delta16`** the new default for `tissue_F`. F sits *at*
+  1.0 at rest, and float16's spacing at 1.0 is ~9.8e-4, so a small strain
+  rounds away entirely: a 0.01% stretch stores as exactly 1.0 under plain
+  float16. `delta16` stores `F − I`, putting the quantisation near zero where
+  float16 is dense, and the same stretch survives as 1.00010002. This is
+  demonstrated against the alternative in `tests/test_trajectory_io.py`, not
+  asserted — the float16 counterpart is run through the same writer and shown
+  to lose it.
+- `particle_ids` / `n_particles_simulated`. The solver needs 24,000 particles;
+  MeshGraphNets takes 1.5k–5k nodes. **3,000 are recorded, and the subset is
+  fixed for the whole episode** — node identity must be stable across time or
+  consecutive frames describe different particles. Metrics are computed over
+  **all 24,000 before subsampling**, because `safety_strain` is a maximum and a
+  maximum over a subset is biased low.
+- `grid_dx`, recorded rather than assumed. §9.2's rule about measuring the world
+  you operate in; the validator previously guessed 1 mm against the solver's
+  1/64 m and rejected a stable episode by a factor of 15.6.
+
+Size, the §9.4 worry: 11.5 MB per 100-step episode at 3,000 particles in
+delta16, against the ~86 MB that 24,000 in float32 would have cost. Subsetting
+did more than the encoding, but both were needed.
+
+#### Bug 1 — the timebase, which no file contradicted
+
+`self.n_substeps` was computed correctly from the P-wave bound. It was then
+**never used**. `advance()` looped `range(self.m.steps)` — the vendored module
+default of 25 — and the writer was handed `n_substeps=self.m.steps` too.
+
+For the stiffest sampled material the recorded frame claimed `dt` = 12.5 ms and
+actually advanced 25 × 117.9 µs = **2.95 ms**. A factor of **4.2**.
+
+Nothing on disk contradicted anything. `dt`, `substep_dt` and `n_substeps` were
+each individually plausible; only their product was wrong. Every check then in
+existence passed. A model trained on it would have learned tissue roughly four
+times too stiff, and no diagnostic would have pointed here — it would have
+looked like an architecture problem, which is exactly what §8.5 says a validator
+exists to prevent.
+
+The fix is that **`self.n_substeps` is the single source of truth**: `advance()`
+loops it, the writer receives it, and `mpm3d.steps` is set from it so module
+state stays coherent for anything else that reads it. `mpm3d.dt` was always
+being set correctly; the bug was that `steps` was not set with it.
+
+Three guards now, because one was demonstrably not enough:
+
+1. `MPMRecorder.__init__` asserts `n_substeps * substep_dt == frame_dt` where
+   the two are established.
+2. `TrajectoryWriter.__init__` raises when `dt` disagrees with
+   `substep_dt * n_substeps` — the caller with the bad numbers is still on the
+   stack. Guarded on both being non-zero, so v1 and PyBullet callers, which
+   record neither, are untouched.
+3. `check_timebase_is_consistent` in the validator, for files already on disk
+   and for any writer that is not ours. SKIPs when the fields are absent.
+
+**`TIMEBASE_TOLERANCE` is relative (1e-6), not absolute, and that was measured
+rather than guessed.** The first version used an absolute 1e-9 s. A real
+episode — 12.5 ms in 24 substeps — drifts **4.7e-10 s**, because `substep_dt` is
+stored as float32 and reconstructing `dt` from it accumulates `n_substeps`
+roundings. A factor of two of margin is one unlucky material away from
+rejecting good data for arithmetic reasons. The relative form is scale-free:
+1e-6 sits four orders above float32 reconstruction error and four below the
+smallest error worth catching (one substep miscounted in a thousand is 1e-3).
+
+#### Bug 2 — density was decoration
+
+`material_params[2]` is ρ, sampled per episode. The solver never saw it. `p_mass`
+is a module-level Python float read inside the P2G kernel (`mpm3d.py:172,180,181`)
+and it was left at the vendored `p_vol * 1000` for every episode.
+
+So the dataset had a density column that did not describe the physics that
+produced it. That is *worse* than not recording density: a model conditioning on
+it would learn to depend on a number that never influenced anything. Measured
+magnitude: at a sampled ρ = 1080 kg/m³ the vendored default is **7.4% off**.
+
+The adapter now sets `p_rho` and `p_mass` before the first `substep()`. Like
+`dt`, `p_mass` is baked in at kernel-compile time, so the ordering is not
+optional — which is why the per-process lock was extended from `dt` alone to the
+**`(substep_dt, p_mass)` pair**. A lock covering only `dt` would let a second
+episode with the same stiffness but a different density run silently at the
+first episode's mass: the identical failure mode, minus the error message.
+
+Demonstrated in `smoke_test_mpm.py`'s 16th check, which also asserts that the
+vendored default and the sampled ρ actually differ — a check that could pass
+while proving nothing is not a check.
+
+#### Bug 3 — the exposure bound was wrong, and passing on luck
+
+`check_logged_metrics_match_recomputation` demanded that recomputed exposure
+**equal** the logged value. For a subset record that is the wrong claim in the
+wrong direction.
+
+Exposure is the fraction of the target *not* occluded. Removing particles can
+only remove occluders, so a subset can only ever look **more** exposed than the
+full set it came from. The relation is a monotone inequality, not an equality.
+Measured, to be sure rather than to argue it: dropping 24,000 → 3,000 moves
+exposure by +1.4e-3, and 24,000 → 300 by +0.12. Always upward, never down.
+
+The equality bound was rejecting correct data. The first fresh 100-step episode
+logged exposure 0.0 over 24,000 particles and recomputed 1.44e-3 over the stored
+3,000 — a real, expected, physically necessary gap, called drift by a 1e-3
+tolerance. The two stale episodes from 17 August had passed the same bound at
+7.4e-4, which is not correctness; it is 26% of margin and a smaller subset away
+from failing.
+
+`safety_strain` already had this right — §9.2 built it as a bounded inequality
+because a maximum over a subset cannot exceed the maximum it is drawn from.
+Exposure simply never got the same treatment. It has it now, in both directions:
+`got < logged` is a **hard failure** (a subset cannot add occlusion, so either
+the logged metric was computed over the subset, or `particle_ids` and
+`tissue_pos` disagree about which particles these are), and `got >> logged` past
+`SUBSET_EXPOSURE_MARGIN` means the subset has stopped representing the tissue.
+
+The success message changed too, from "logged metrics reproduce to 1e-3" to
+"consistent with full-set bounds". **"Reproduce" is a claim about equality and it
+was false.** Wording that trains the reader to expect the wrong relation makes
+the correct check look like a weakened one.
+
+#### Bug 4 — `--episodes N` could not work at all
+
+Recorded in `aeadc2c`'s commit message and fixed here. Taichi bakes module-level
+constants into kernels at compile time, and this adapter now sets two of them
+per material. A second episode in one interpreter therefore either runs at the
+first episode's physics or trips the compile lock. It tripped, correctly — but
+the error message claimed "the CLI already does" collect one episode per
+process, and `main()` did no such thing; it looped in-process.
+
+**The parent now launches one child per episode** with `sys.executable`, an
+explicit `--index`, and `check=True`. `--index` is what makes recursion
+structurally impossible rather than merely unlikely: the parent always passes
+it, and a process holding it never dispatches. `--episodes 1` stays in-process,
+since there is nothing to collide with.
+
+**Rejected, `os.fork()`:** it would skip the ~10 s kernel compile, which is the
+entire cost. But at fork time the process holds a live Metal device, a compiled
+kernel cache and Taichi's runtime threads, and only the forking thread survives
+into the child. The child would inherit a GPU context whose owning threads no
+longer exist. A crash if you are lucky.
+
+**Rejected, one worst-case substep for the whole dataset:** it would let a single
+interpreter do everything, because nothing would vary. But the stiffest material
+in `materials.py`'s ranges needs 106 substeps per frame against the softest's 24,
+so pinning every episode to the stiffest makes soft episodes ~4× more expensive
+for no gain in fidelity.
+
+The cost accepted instead is that each child recompiles, since Taichi's offline
+cache is keyed on the constants and every material has a different `dt`.
+Measured: 15.9 s and 21.3 s for the two 100-step episodes, 37.4 s wall total,
+most of it compilation.
+
+#### The stale tests, and what they were actually saying
+
+`aeadc2c` shipped with two failing tests, deliberately. Both were in
+`TestSubstepStability` and both were the fixture, not the check: `write_episode`
+computed its default substep with `suggested_substep_dt(20000.0, 1050.0, dx)` —
+**no `lam`** — so it picked a bar-wave step ~16× too large and the check
+correctly failed an episode the fixture called valid.
+
+The fixture now derives its advisory from whatever material the test passes,
+with `lam`. It also no longer hardcodes `n_substeps=40` against an unrelated
+`dt`; the writer's new invariant refused that immediately, which is the guard
+working on its first contact with existing code.
+
+The more interesting repair is `test_the_same_substep_is_fine_for_soft_tissue`.
+Its "soft" material dropped μ tenfold, 20 kPa → 200 Pa, but left λ at 200 kPa.
+Under a P-wave bound that moves the advisory by **9%** — 19.8 µs to 21.7 µs — so
+the soft episode failed at the same substep as the stiff one and the test was
+asserting something that had stopped being true. **Under this bound, softness is
+λ, not μ.** The pair now shares a 50 µs substep that genuinely straddles the two
+advisories:
+
+| material | λ + 2μ | P-wave advisory | ratio at 50 µs | verdict |
+|---|---|---|---|---|
+| stiff, μ = 20 kPa, λ = 2e5 | 240 000 | 19.84 µs | 2.52 | FAIL |
+| soft, μ = 200, λ = **2e4** | 20 400 | 68.06 µs | 0.73 | PASS |
+| soft, μ = 200, λ = 2e5 *(the old one)* | 200 400 | 21.72 µs | 2.30 | FAIL |
+
+A third test pins the straddle itself, so a later edit to either material cannot
+quietly make both tests trivially agree.
+
+#### Coverage moved out of `__main__`
+
+`trajectory_io.py`'s self-test stays — `SETUP_GUIDE.md` tells the user to run it
+and both `verify_*.py` scripts run it as a subprocess, which is a different job.
+But it was the *only* cover for delta16, the subset bookkeeping and the schema
+upgrade path, and a self-test behind `if __name__ == "__main__"` runs only when
+someone remembers, stops at the first failure, and cannot be collected or
+counted. `tests/test_trajectory_io.py` now holds 29 tests over those properties.
+
+#### The seed does less than it looks like it does
+
+Recorded because the metadata would otherwise imply something false. `mpm3d.py`
+calls `ti.init(arch=arch)` with **no `random_seed`** (line 22), so Taichi's RNG
+starts at 0 in every process and `init_cube()`'s `ti.random()` lays out an
+**identical particle cloud in every episode**. The episode seed drives numpy
+only: the material draw and which particles get recorded.
+
+So a dataset collected this way varies in material and in nothing else. The
+episode `notes` now say so in as many words. Fixing it means seeding Taichi per
+episode, which is a change to how the vendored solver is initialised and belongs
+with the PSM work rather than here; naming it is the cheap half.
+
+#### The stale files, kept
+
+`data_mpm/stale/` holds the two 17 August episodes. `mpm_0000.npz` ran 60 frames
+at a 500 µs substep its material happened to tolerate; `mpm_0001.npz` is a
+one-frame partial written by `__exit__` after its material diverged at the same
+substep. They are the evidence behind the P-wave finding and behind Bug 3's
+"passing on luck", and they are not a baseline for anything: they predate the
+density fix, so they ran at ρ = 1000 regardless of what they record. Ignored by
+git, kept on disk, and deliberately not deleted until this section existed.
+
+#### Verification, run in order
+
+```
+pytest tests/ -q                                 249 passed
+python src/trajectory_io.py                      OK (v1, v2 float16, v2.1 subset + delta16)
+python host/smoke_test_mpm.py                    16 passed, 0 failed, 1 warning, arch=metal
+python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100
+                                                 mpm_0000.npz 11.5 MB 15.9s
+                                                 mpm_0001.npz 11.5 MB 21.3s
+python host/validate_dataset.py --data data_mpm/ 24 passed, 3 warned, 2 skipped, 0 failed (exit 0)
+```
+
+Per-file invariants, asserted directly rather than inferred from a green run:
+
+| | `mpm_0000` | `mpm_0001` |
+|---|---|---|
+| timebase | 12.5 ms = 24 × 520.833 µs, rel drift 3.7e-8 | 12.5 ms = 106 × 117.925 µs, rel drift 0.0 |
+| μ, λ | 3758 Pa, 69 279 Pa | 2112 Pa, 1 592 053 Pa |
+| ρ → `p_mass` | 1004.1 → 4.787909e-4 ✓ | 1014.4 → 4.837112e-4 ✓ |
+
+`mpm_0001` is the material that diverged on 17 August. It now runs 106 substeps
+of 117.9 µs per frame and completes 100 frames.
+
+The two remaining WARNs are expected and are not defects: no grasp is ever
+active (there is no robot yet), and `mpm_0000` shows 18.7% volume change, which
+is a real property of a soft λ = 69 kPa material settling under gravity, flagged
+by a threshold tuned for near-incompressible tissue. Both are honest reports
+about a passive-settling episode.
+
+#### Still not done
+
+- **No robot.** `ee_pose` and `action` are whatever the caller passes; the tissue
+  is driven by gravity and its own elasticity. The SDF seam in `sdf.py` is where
+  the PSM plugs in, and `smoke_test_mpm.py` establishing that `substep()` runs
+  with no PyBullet scene is what makes that seam testable in isolation.
+- **Material ranges are still placeholders** (§8.3). Liver, bowel and fat differ
+  by more than the width of those ranges. Two episodes with σ(log μ) = 0.29 is a
+  demonstration that collection works, not a dataset.
+- **Taichi's seed is fixed**, as above.
+- **§4 is still open** for the PyBullet side. Nothing here touches it.
+
+---
 ## 10. Files
 
 Every path below was checked against the repository on 17 August 2026.
@@ -1012,10 +1289,11 @@ copy is the shareable view, not the only copy.
 | `host/verify_host.py` | macOS | GPU reachability checks | |
 | `host/train_dynamics.py` | macOS | MLP baseline on MPS | |
 | `host/visualize_trajectory.py` | macOS | 3D animation + stability diagnostics | |
-| `host/validate_dataset.py` | macOS | 14 data-integrity checks | §8.5, §9.2 |
-| `host/smoke_test_mpm.py` | macOS | MPM smoke test, 15 checks | §9.4, **passes** |
+| `host/validate_dataset.py` | macOS | 16 data-integrity checks | §8.5, §9.2, §9.5 |
+| `host/smoke_test_mpm.py` | macOS | MPM smoke test, 16 checks | §9.4, §9.5, **16/16** |
 | `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
 | `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
+| `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5 |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |

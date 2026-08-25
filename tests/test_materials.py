@@ -296,3 +296,93 @@ class TestSuggestedSubstepDt:
             suggested_substep_dt(1000.0, 1050.0, 1e-3, safety=0.0)
         with pytest.raises(ValueError, match="safety"):
             suggested_substep_dt(1000.0, 1050.0, 1e-3, safety=1.5)
+
+
+class TestPWaveSubstepBound:
+    """The `lam=` branch -- the bound that actually holds for tissue.
+
+    Everything in TestSuggestedSubstepDt exercises the lam-less bar wave, which
+    is an UPPER bound. These pin the branch that replaced it in anger: sampling
+    the default ranges and running the vendored MPM at its fixed 500 us step,
+    the bar-wave bound called every material safe while three of six diverged.
+    The P-wave bound flagged exactly those three.
+    """
+
+    def test_agrees_with_the_stated_p_wave_formula(self):
+        mu, lam, rho, dx, safety = 1500.0, 2.0e5, 1050.0, 1.2e-3, 0.3
+        expected = safety * dx / np.sqrt((lam + 2.0 * mu) / rho)
+        got = suggested_substep_dt(mu, rho, dx, safety, lam=lam)
+        assert got == pytest.approx(expected, rel=1e-12)
+
+    def test_is_stricter_than_the_bar_wave_for_tissue(self):
+        """lambda >> mu is the whole point: for near-incompressible tissue the
+        pressure wave outruns the shear wave and the honest step is smaller."""
+        mu, lam, rho, dx = 200.0, 1.5e5, 1050.0, 1e-3
+        bar = suggested_substep_dt(mu, rho, dx)
+        pwave = suggested_substep_dt(mu, rho, dx, lam=lam)
+        assert pwave < bar
+        # sqrt((lam + 2mu)/(3mu)) -- ~16x at the ratios materials.py reaches.
+        assert bar / pwave == pytest.approx(
+            np.sqrt((lam + 2.0 * mu) / (3.0 * mu)), rel=1e-12)
+
+    def test_the_two_bounds_converge_when_lambda_matches_mu(self):
+        """Not a special case so much as a sanity anchor: at lambda = mu the
+        P-wave speed is sqrt(3mu/rho), exactly the bar wave, so the branch
+        cannot be introducing a constant factor anywhere."""
+        mu, rho, dx = 1000.0, 1050.0, 1e-3
+        assert suggested_substep_dt(mu, rho, dx, lam=mu) == pytest.approx(
+            suggested_substep_dt(mu, rho, dx), rel=1e-12)
+
+    def test_omitting_lam_still_gives_the_bar_wave(self):
+        """The default must not have moved when the branch was added -- v1 and
+        PyBullet callers pass no lambda and must get what they always got."""
+        mu, rho, dx = 1500.0, 1050.0, 1.2e-3
+        assert suggested_substep_dt(mu, rho, dx) == pytest.approx(
+            0.3 * dx / np.sqrt(3.0 * mu / rho), rel=1e-12)
+
+    @pytest.mark.parametrize("bad_lam", [0.0, -1.0, -1.0e5])
+    def test_non_positive_lambda_raises(self, bad_lam):
+        """lambda <= 0 is not a soft edge case. A negative lambda makes
+        (lam + 2mu) small or negative, so the step comes back huge or NaN --
+        an unstable episode that looks fine. Refuse it at the source."""
+        with pytest.raises(ValueError, match="lam must be positive"):
+            suggested_substep_dt(1000.0, 1050.0, 1e-3, lam=bad_lam)
+
+    def test_rejects_a_negative_lambda_hidden_in_an_array(self):
+        """The vectorised path must be as strict as the scalar one; `np.any`
+        is what makes one bad draw in a batch fail rather than average away."""
+        mu = np.full(8, 1000.0)
+        lam = np.full(8, 2.0e5)
+        lam[5] = -1.0
+        with pytest.raises(ValueError, match="lam must be positive"):
+            suggested_substep_dt(mu, 1050.0, 1e-3, lam=lam)
+
+    def test_vectorised_over_a_batch_of_sampled_materials(self):
+        """The real call shape: unpack_material gives (N,) mu/lam/rho and the
+        adapter needs one step per episode from them."""
+        rng = np.random.default_rng(7)
+        draws = np.stack([sample_material(rng) for _ in range(64)])
+        mu, lam, rho = unpack_material(draws)
+        dt = suggested_substep_dt(mu, rho, 1 / 64.0, lam=lam)
+        assert dt.shape == (64,)
+        assert np.all(dt > 0) and np.all(np.isfinite(dt))
+        # Every one of them stricter than its own bar-wave counterpart.
+        assert np.all(dt < suggested_substep_dt(mu, rho, 1 / 64.0))
+
+    def test_broadcasts_scalar_rho_and_dx_against_vector_material(self):
+        mu = np.array([200.0, 2000.0, 20000.0])
+        lam = np.array([2.0e4, 2.0e5, 2.0e6])
+        dt = suggested_substep_dt(mu, 1050.0, 1e-3, lam=lam)
+        assert dt.shape == (3,)
+        # Monotone decreasing in stiffness, which is the property the whole
+        # per-episode substep design rests on.
+        assert dt[0] > dt[1] > dt[2]
+
+    def test_the_spread_across_the_default_ranges_is_what_the_log_claims(self):
+        """§9.4/§9.5: lambda/mu reaches ~750 in these ranges, so the two bounds
+        differ by ~16x. If this ratio moves, the decision log is stale."""
+        mu, lam = DEFAULT_MU_RANGE[0], DEFAULT_LAM_RANGE[1]
+        ratio = suggested_substep_dt(mu, 1050.0, 1e-3) / \
+            suggested_substep_dt(mu, 1050.0, 1e-3, lam=lam)
+        assert ratio == pytest.approx(np.sqrt((lam + 2 * mu) / (3 * mu)), rel=1e-12)
+        assert 10.0 < ratio < 100.0

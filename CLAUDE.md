@@ -40,11 +40,12 @@ host-only — not a preference, the wheel does not exist (§9.3).
 ```bash
 # host
 conda activate tissue-host
-pytest tests/ -q                                    # 200 tests
+pytest tests/ -q                                    # 249 tests
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
-python host/smoke_test_mpm.py                       # 15 checks, §9.4; ~10s first run
+python host/smoke_test_mpm.py                       # 16 checks, §9.4; ~10s first run
+python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
@@ -127,6 +128,10 @@ chronological one. Both are in the repo and must stay there.
   from a model trained on them.
 - **`data/` is schema v1** — no `F`, no material params, no `boundary_mask`.
   Those checks SKIP on it, correctly.
+- **`data_mpm/` is gitignored and regenerable** — two v2.1 episodes from
+  `mpm_adapter.py`, validating clean. `data_mpm/stale/` keeps the two 17 August
+  files as §9.5's evidence: they predate both the P-wave substep and the density
+  fix, so they ran at ρ = 1000 whatever they record. Evidence, never a baseline.
 - **The MLP is a placeholder.** MeshGraphNets is the target; the schema already
   carries `tissue_faces` / `tissue_tets`.
 
@@ -163,12 +168,51 @@ avoid, defaulting to `s_nu=0.2`. Measured round-trip error is small (2.7e-4) but
 pointless: **the adapter writes `mpm3d.mu[None]` and `mpm3d.la[None]` directly
 and never calls `set_parameters()`.**
 
-### Next: the adapter
+### The adapter — done and verified (§9.5)
 
-Read MPM particle state, write a v2 `.npz`. The mapping is verified, not
-assumed: `F_x → tissue_pos` (N,3), `F_v → tissue_vel` (N,3), `F → tissue_F`
-(N,3,3), all float32, no reshape, and `TrajectoryWriter` already accepts them.
+`host/mpm_adapter.py` drives the vendored MPM and writes v2.1 episodes. The
+mapping is what §9.4 verified: `F_x → tissue_pos`, `F_v → tissue_vel`,
+`F → tissue_F`, no reshape.
 
-Watch the size. `tissue_F` is 864 KB/frame at 24k particles — a 100-step episode
-is ~86 MB, twenty is ~1.7 GB. `trajectory_io.py`'s `store_F_as_float16` flag was
-written for exactly this trigger and the trigger has now been reached.
+```bash
+python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100
+python host/validate_dataset.py --data data_mpm/     # exit 0, no FAIL
+```
+
+11.5 MB per 100-step episode (3,000 of 24,000 particles, `delta16`), ~16-21 s
+each. What you need to know before touching it:
+
+- **`--episodes N` launches one child process per episode.** Taichi bakes `dt`
+  AND `p_mass` into kernels at compile time, so two materials cannot share an
+  interpreter. Not `os.fork()` — the child would inherit a Metal context whose
+  owning threads did not survive the fork. `--index` marks a child and is what
+  makes recursion impossible; a process holding it never dispatches.
+- **`self.n_substeps` is the single source of truth for the timebase**, never
+  `mpm3d.steps`. The reverse shipped once: every frame advanced 2.95 ms while
+  claiming 12.5 ms, and nothing on disk contradicted anything. `dt` must equal
+  `substep_dt * n_substeps` — asserted in the adapter, the writer and the
+  validator.
+- **`p_mass = p_vol * rho` is set before the first substep.** Until it was, the
+  sampled density was decoration: the solver ran every episode at ρ = 1000
+  while the file recorded something else.
+- **The episode seed drives numpy only** — material and subset. `mpm3d.py` calls
+  `ti.init()` with no `random_seed`, so the initial particle cloud is identical
+  in every episode. Do not read "seed=N" as an independent initial condition.
+- **Metrics are computed over all 24,000 particles before subsampling**, because
+  `safety_strain` is a maximum and a maximum over a subset is biased low.
+- **Subset metrics are bounded, not equated.** Exposure over a subset can only
+  be ≥ the logged full-set value (removing particles removes occluders); peak
+  stretch can only be ≤ it. Demanding equality rejected correct data.
+
+### Next: the robot
+
+There is no PSM. `ee_pose` and `action` are whatever the caller passes and the
+tissue is driven by gravity alone, so every episode is passive settling —
+`grasp is consistent` WARNs on all of them, correctly. PyBullet supplies
+rigid-body collision through the SDF in `sdf.py`, and that is the seam. The
+adapter binds `SDF` and `collision_mask` by hand and fills the SDF large and
+positive, which is what lets the solver run with no scene at all; the PSM
+replaces exactly that.
+
+Material ranges in `materials.py` are still placeholders, so no result should be
+claimed from a model trained on this data yet.

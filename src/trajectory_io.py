@@ -199,6 +199,24 @@ KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0", "2.1")
 # float32 F, so this never leaks past load_trajectory(). See F ENCODINGS above.
 F_ENCODINGS = ("float32", "float16", "delta16")
 
+# How far dt may drift from substep_dt * n_substeps before the writer refuses
+# the episode, as a FRACTION of dt.
+#
+# WHY RELATIVE AND NOT ABSOLUTE: substep_dt is stored as float32, so
+# reconstructing dt from it accumulates up to n_substeps roundings. Measured on
+# a real episode: dt = 12.5 ms in 24 substeps drifts 4.7e-10 s, which an
+# absolute 1e-9 s bound clears by only a factor of two -- one unlucky material
+# away from rejecting a perfectly good episode for arithmetic reasons. The
+# relative form is scale-free, so it does not need re-tuning when frame_dt or
+# the substep count changes.
+#
+# 1e-6 is four orders of magnitude above float32 reconstruction error and four
+# below the smallest error worth catching: one substep miscounted out of 1000
+# is a 1e-3 timebase error, and the bug this exists for was 3.2 (a factor of
+# 4.2). There is nothing in between that is both physically meaningful and
+# undetectable here.
+TIMEBASE_TOLERANCE = 1e-6
+
 # The undeformed deformation gradient. "delta16" stores F - I so that the
 # quantisation error lands where float16 is precise (near 0) instead of where
 # it is coarse (near 1). Defined once so the encoder and decoder cannot drift.
@@ -326,6 +344,27 @@ class TrajectoryWriter:
             if material_params is not None else np.zeros(0, np.float32)
         self.substep_dt = float(substep_dt)
         self.n_substeps = int(n_substeps)
+        # THE TIMEBASE MUST CLOSE. dt is seconds per RECORDED frame; substep_dt
+        # x n_substeps is how much time the solver was actually asked to
+        # advance between frames. If they disagree, every velocity, every
+        # finite difference and every learned dynamics model downstream is
+        # scaled by the ratio, and nothing in the file looks wrong -- the three
+        # numbers are individually plausible and only their product is a lie.
+        #
+        # WHY THE ZERO GUARD: v1 files and the PyBullet collector record
+        # neither field (0.0 means "not recorded", per the module docstring),
+        # and a solver that does not substep is not lying about anything. Only
+        # a caller claiming BOTH is held to the claim.
+        if self.substep_dt > 0.0 and self.n_substeps > 0 and self.dt > 0.0:
+            implied = self.substep_dt * self.n_substeps
+            rel = abs(implied - self.dt) / self.dt
+            if rel > TIMEBASE_TOLERANCE:
+                raise ValueError(
+                    f"timebase does not close: substep_dt {self.substep_dt:.6e} s "
+                    f"x n_substeps {self.n_substeps} = {implied:.6e} s, but dt "
+                    f"is {self.dt:.6e} s (off by {rel:.2%}, tolerance "
+                    f"{TIMEBASE_TOLERANCE:.0e}). A recorded frame must advance "
+                    "the solver by exactly dt.")
         self.boundary_mask = _as(boundary_mask, bool, (-1,)) \
             if boundary_mask is not None else np.zeros(0, bool)
         self.target_origin = _as(target_origin, np.float32, (3,)) \

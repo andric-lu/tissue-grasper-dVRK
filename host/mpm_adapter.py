@@ -14,8 +14,10 @@ mapping rather than assuming it:
     F_v -> tissue_vel     (N,3) float32
     F   -> tissue_F       (N,3,3) float32
 
-Four decisions are baked in here. Each one is a rule from CLAUDE.md meeting its
-first real consumer, and each would be easy to get quietly wrong.
+Six decisions are baked in here. Each one is a rule from CLAUDE.md meeting its
+first real consumer, and each would be easy to get quietly wrong. Decisions 5
+and 6 are here because the first version of this file got them wrong and the
+data did not look wrong -- see DECISION_LOG.md section 9.5.
 
 1. MU AND LAMBDA ARE WRITTEN DIRECTLY. `mpm3d.set_parameters(s_E, s_nu)` takes
    (E, nu) and internally computes lambda = E*nu/((1+nu)(1-2nu)) -- the singular
@@ -42,6 +44,24 @@ first real consumer, and each would be easy to get quietly wrong.
    rescale gravity with it, or the two silently disagree and everything falls at
    the wrong rate. `domain_scale` exists to make that coupling visible.
 
+5. THE TIMEBASE IS `self.n_substeps`, NOT `mpm3d.steps`. Every recorded frame
+   must advance the solver by exactly `frame_dt`, so
+   n_substeps * substep_dt == frame_dt. The first version computed n_substeps
+   from the P-wave bound, wrote it to disk, and then advanced the vendored
+   module default of 25 instead: frames labelled 12.5 ms advanced 2.95 ms, and
+   every number in the file agreed with every other one. Asserted here, in
+   TrajectoryWriter, and in validate_dataset.py.
+
+6. DENSITY REACHES THE SOLVER, VIA p_mass. `mpm3d.p_mass` is read inside the
+   P2G kernel, so it is baked in at compile time exactly like `dt`, and until
+   this file set it the solver ran every episode at the vendored rho = 1000
+   while material_params recorded whatever was sampled. Both constants are
+   covered by the per-process compile lock, because they are frozen by the same
+   mechanism at the same moment.
+
+ONE EPISODE PER PROCESS. Those two baked-in constants are why `--episodes N`
+launches a child per episode rather than looping. See main().
+
 WHAT THIS DOES NOT YET DO: there is no robot. PyBullet supplies rigid-body
 collision through the SDF in `sdf.py`, and that is where the PSM plugs in later;
 until then `ee_pose` and `action` are whatever the caller passes, and the tissue
@@ -53,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from typing import Optional, Sequence
@@ -133,22 +154,65 @@ class MPMRecorder:
         self.substep_dt = frame_dt / self.n_substeps
         self.frame_dt = float(frame_dt)
 
+        # THE TIMEBASE INVARIANT, asserted where it is established. Every
+        # recorded frame must advance the solver by exactly frame_dt, so
+        # n_substeps * substep_dt == frame_dt is not a coincidence to check
+        # later but the definition of the two lines above. It is asserted here,
+        # again in the writer, and again in the validator, because the first
+        # version of this adapter satisfied none of them: it computed
+        # n_substeps correctly and then advanced mpm3d.steps (= 25) instead,
+        # so a frame labelled 12.5 ms actually advanced 2.95 ms. Nothing on
+        # disk contradicted itself -- the file was internally consistent and
+        # physically a lie.
+        drift = abs(self.n_substeps * self.substep_dt - self.frame_dt)
+        if drift > 1e-12:
+            raise RuntimeError(
+                f"timebase does not close: {self.n_substeps} x "
+                f"{self.substep_dt:.6e} s != frame_dt {self.frame_dt:.6e} s "
+                f"(off by {drift:.3e} s)")
+
+        # Density: p_mass is what the P2G kernel actually weights particles by
+        # (mpm3d.py:172,180,181), and it is a module-level Python float, so it
+        # is baked in at COMPILE time exactly like dt. Until this line existed
+        # the solver ran every episode at the vendored p_rho = 1000 while
+        # material_params[2] recorded the sampled rho, which made the density
+        # column of the dataset a decoration. Set both so anything reading
+        # p_rho agrees with what p_mass implies.
+        mpm3d.p_rho = self.rho
+        mpm3d.p_mass = mpm3d.p_vol * self.rho
+
         # Taichi captures module-level Python constants when a kernel COMPILES,
         # so this must happen before the first substep() and cannot be changed
         # afterwards in the same process. Verified: setting it here and running
         # free fall reproduces -g*t at the NEW dt exactly. The consequence is
-        # one substep_dt per process -- see the guard below.
-        if getattr(mpm3d, "_adapter_dt_locked", None) is not None:
-            locked = mpm3d._adapter_dt_locked
-            if abs(locked - self.substep_dt) > 1e-15:
+        # one (substep_dt, p_mass) pair per process -- see the guard below.
+        #
+        # BOTH are locked, not just dt. They are baked by the same mechanism at
+        # the same moment, so a lock covering only dt would let a second episode
+        # with the same stiffness but a different density run silently at the
+        # first episode's mass -- the identical failure mode, minus the error
+        # message.
+        locked = getattr(mpm3d, "_adapter_compile_lock", None)
+        if locked is not None:
+            l_dt, l_mass = locked
+            if abs(l_dt - self.substep_dt) > 1e-15 or abs(l_mass - mpm3d.p_mass) > 1e-30:
                 raise RuntimeError(
                     f"this process already compiled MPM kernels with substep "
-                    f"dt={locked:.3e} s and Taichi bakes that constant in at "
-                    f"compile time; this episode needs {self.substep_dt:.3e} s. "
-                    "Collect one episode per process (the CLI already does), or "
-                    "fix the substep across the dataset.")
+                    f"dt={l_dt:.3e} s and p_mass={l_mass:.6e} kg, and Taichi "
+                    f"bakes both constants in at compile time; this episode "
+                    f"needs dt={self.substep_dt:.3e} s and "
+                    f"p_mass={mpm3d.p_mass:.6e} kg. Collect one episode per "
+                    "process -- `--episodes N` does this by launching a child "
+                    "per episode; calling MPMRecorder twice in one interpreter "
+                    "does not.")
         mpm3d.dt = self.substep_dt
-        mpm3d._adapter_dt_locked = self.substep_dt
+        # steps is NOT baked in -- it appears only in Python-level loops
+        # (mpm3d.py:511,611), never inside a kernel -- but it is set here
+        # anyway so that anything reading module state sees one coherent
+        # timebase. `advance()` uses self.n_substeps, not this.
+        mpm3d.steps = self.n_substeps
+        mpm3d.timestep = self.n_substeps * self.substep_dt
+        mpm3d._adapter_compile_lock = (self.substep_dt, mpm3d.p_mass)
 
         backend = str(ti.lang.impl.current_cfg().arch)
         if "metal" not in backend.lower():
@@ -203,9 +267,22 @@ class MPMRecorder:
             simulator="taichi_mpm",
             task=task,
             dt=self.frame_dt,                   # seconds per RECORDED step
+            # SEED HONESTY. `seed` here drives numpy only: the material draw and
+            # which particles get recorded. It does NOT vary the initial
+            # particle cloud. mpm3d.py calls ti.init(arch=arch) with no
+            # random_seed (line 22), so Taichi's RNG starts at 0 in every
+            # process and init_cube()'s ti.random() lays out an identical cloud
+            # every episode. Writing "seed=N" without this note would imply an
+            # independent initial condition that does not exist, and a dataset
+            # whose episodes all start from the same geometry is a narrower
+            # dataset than its metadata suggests. Naming it here is the cheap
+            # half of fixing it.
             notes=notes or (
                 f"vendored MPM cb797f36, backend={backend}, "
-                f"{self.n_record}/{n_sim} particles, seed={seed}, "
+                f"{self.n_record}/{n_sim} particles, seed={seed} "
+                f"(material + subset only; taichi RNG fixed at 0, so the "
+                f"initial particle cloud is identical across episodes), "
+                f"rho={self.rho:.1f} kg/m^3 applied as p_mass={self.m.p_mass:.6e} kg, "
                 f"domain_scale={DOMAIN_SCALE_M} m, "
                 f"substep {self.substep_dt*1e6:.1f} us x {self.n_substeps} "
                 f"(P-wave advisory, safety={substep_safety})"),
@@ -214,8 +291,11 @@ class MPMRecorder:
             # and a network fed raw Pascals burns capacity on the exponent.
             material_params=np.array(
                 [np.log(self.mu), np.log(self.lam), self.rho], np.float32),
-            substep_dt=self.m.dt,
-            n_substeps=self.m.steps,
+            # The adapter's own values, not a read-back of module state. Reading
+            # them off mpm3d is how n_substeps came to be recorded as the
+            # vendored 25 while the episode was integrated at a different rate.
+            substep_dt=self.substep_dt,
+            n_substeps=self.n_substeps,
             # Measured off the solver, not assumed. dx = 1/n_grid = 15.6 mm
             # here; a validator guessing 1 mm rejects a stable episode by a
             # factor of 15.6, which is exactly what happened before this was
@@ -272,9 +352,15 @@ class MPMRecorder:
     # -- driving -----------------------------------------------------------
     def advance(self, n_frames: int = 1, scale: float = 1.0,
                 threshold: float = 0.05) -> None:
-        """Run `n_frames` recorded steps' worth of substeps."""
+        """Run `n_frames` recorded steps' worth of substeps.
+
+        self.n_substeps, NOT self.m.steps. The module global is the vendored
+        default (25) and has nothing to do with this episode's material; using
+        it here is what made recorded frames advance the wrong amount of time
+        while every number written to disk agreed with every other one.
+        """
         for _ in range(n_frames):
-            for _ in range(self.m.steps):
+            for _ in range(self.n_substeps):
                 self.m.substep(scale, threshold)
         self.ti.sync()
 
@@ -378,21 +464,91 @@ def record_episode(path: str, *, n_steps: int = 100, seed: int = 0,
     return out
 
 
+def _episode_path(out_dir: str, index: int) -> str:
+    return os.path.join(out_dir, f"mpm_{index:04d}.npz")
+
+
 def main(argv=None) -> int:
+    """Collect episodes, ONE INTERPRETER EACH.
+
+    WHY A CHILD PROCESS PER EPISODE. Taichi bakes module-level Python constants
+    into a kernel when it compiles, and this adapter sets two of them per
+    material: `dt` (from the P-wave bound) and `p_mass` (from the sampled
+    density). Once the first substep() has compiled, neither can change. A
+    second episode in the same interpreter therefore either runs at the first
+    episode's physics -- silently, with truthful-looking metadata -- or trips
+    the compile lock in MPMRecorder.__init__. The lock is the safety net; a
+    fresh interpreter is the fix.
+
+    REJECTED, os.fork(): it would skip the ~10 s kernel compile, which is the
+    whole cost here. But at fork time this process holds a live Metal device,
+    a compiled-kernel cache and Taichi's runtime threads. Only the forking
+    thread survives into the child, so the child inherits a GPU context whose
+    owning threads no longer exist. That is a crash if you are lucky.
+
+    REJECTED, one worst-case substep for the whole dataset: it would let a
+    single interpreter do everything, because nothing would vary. But the
+    stiffest material in materials.py's ranges needs ~106 substeps per frame
+    against the softest's ~24, so pinning every episode to the stiffest makes
+    soft episodes roughly 4x more expensive for no gain in fidelity. Dataset
+    collection is already the slow part.
+
+    The cost accepted instead: each child recompiles, because Taichi's offline
+    cache is keyed on the constants and every material has a different `dt`.
+    Roughly 10 s per episode, paid once each, in parallel with nothing.
+    """
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--out", default="data_mpm", help="output directory")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--steps", type=int, default=100, help="recorded steps/episode")
     ap.add_argument("--n-record", type=int, default=DEFAULT_N_RECORD,
-                    help=f"particles to record (solver simulates 24000)")
+                    help="particles to record (solver simulates 24000)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--index", type=int, default=None,
+                    help="collect exactly this one episode index and exit. Set "
+                         "by the parent on each child; giving it by hand "
+                         "collects a single episode without dispatching.")
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
-    for i in range(args.episodes):
-        record_episode(os.path.join(args.out, f"mpm_{i:04d}.npz"),
-                       n_steps=args.steps, seed=args.seed + i,
+
+    # THE CHILD BRANCH. `--index` present means "you are the one episode".
+    # Dispatch never happens here, so recursion is structurally impossible
+    # rather than merely unlikely -- the parent always passes --index, and a
+    # process holding --index never spawns.
+    if args.index is not None:
+        record_episode(_episode_path(args.out, args.index),
+                       n_steps=args.steps, seed=args.seed + args.index,
                        n_record=args.n_record)
+        return 0
+
+    # A single episode needs no isolation: there is nothing to collide with,
+    # and a subprocess would add an interpreter start-up for nothing.
+    if args.episodes == 1:
+        record_episode(_episode_path(args.out, 0), n_steps=args.steps,
+                       seed=args.seed, n_record=args.n_record)
+        print(f"\nwrote 1 episode to {args.out}/")
+        print(f"validate with: python host/validate_dataset.py --data {args.out}/")
+        return 0
+
+    # THE PARENT BRANCH. This interpreter must not import mpm3d -- doing so
+    # would run ti.init() and compile kernels here, which is the state we are
+    # isolating the children from. record_episode() is never called on this
+    # path.
+    for i in range(args.episodes):
+        cmd = [sys.executable, os.path.abspath(__file__),
+               "--out", args.out,
+               "--steps", str(args.steps),
+               "--n-record", str(args.n_record),
+               "--seed", str(args.seed),
+               "--index", str(i)]
+        print(f"[{i + 1}/{args.episodes}] {' '.join(cmd[-2:])} "
+              f"-> {os.path.basename(_episode_path(args.out, i))}")
+        # check=True so a diverged or crashed episode stops the run loudly.
+        # Silently continuing would leave a gap in the numbering and a dataset
+        # whose episode count does not match what was asked for.
+        subprocess.run(cmd, check=True)
+
     print(f"\nwrote {args.episodes} episode(s) to {args.out}/")
     print(f"validate with: python host/validate_dataset.py --data {args.out}/")
     return 0

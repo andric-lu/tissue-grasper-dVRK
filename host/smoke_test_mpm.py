@@ -536,6 +536,66 @@ def _():
                     f"{got}, {size_mb:.1f} MB on disk")
 
 
+@check("Sampled density reaches the solver as p_mass, and is what gets recorded")
+def _():
+    # WHY: material_params[2] is rho, and until the adapter set p_mass the
+    # solver ignored it completely -- every episode ran at the vendored
+    # p_rho = 1000 while the file claimed whatever was sampled. Nothing was
+    # inconsistent on disk. The dataset simply had a density column that did
+    # not describe the physics that produced it, which is worse than not
+    # recording density at all: a model would learn to condition on a number
+    # that never influenced anything.
+    #
+    # p_mass is a module-level Python float read inside the P2G kernel
+    # (mpm3d.py:172,180,181), so it is baked in when kernels compile, exactly
+    # like dt. This check verifies the arithmetic and the recording; the
+    # ORDERING (set before first substep) is enforced in the adapter, whose
+    # compile lock covers p_mass as well as dt.
+    sys.path.insert(0, os.path.join(REPO, "src"))
+    import materials
+    import trajectory_io
+
+    rng = np.random.default_rng(3)
+    mat = materials.sample_material(rng)
+    _, _, rho = materials.unpack_material(mat)
+    rho = float(rho)
+
+    applied = mpm3d.p_vol * rho
+    vendored = mpm3d.p_vol * 1000.0
+
+    # Demonstrated against the failure, per section 5: if the vendored default
+    # happened to equal the sampled density, this check would pass while
+    # proving nothing. Sampled rho spans 1000-1100, so it does not.
+    if abs(applied - vendored) <= 0.0:
+        return "FAIL", (f"sampled rho={rho:.1f} gives the same p_mass as the "
+                        "vendored 1000 -- this check cannot distinguish the bug "
+                        "it exists to catch")
+
+    # And the number the file records must be the number that was applied.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "rho.npz")
+        w = trajectory_io.TrajectoryWriter(
+            out, simulator="mpm", task="rho_check", dt=0.0125,
+            material_params=mat, substep_dt=0.0125 / 25, n_substeps=25,
+            action_spec="unknown")
+        w.append(tissue_pos=np.zeros((4, 3), np.float32),
+                 ee_pose=np.array([0, 0, 0, 0, 0, 0, 1], np.float32),
+                 action=np.zeros(7, np.float32))
+        w.close()
+        _, _, rho_back = materials.unpack_material(
+            trajectory_io.load_trajectory(out).material_params)
+
+    err = abs(float(rho_back) - rho)
+    if err > 0.05:                      # float32 storage of ~1e3 kg/m^3
+        return "FAIL", (f"recorded rho {float(rho_back):.4f} != applied rho "
+                        f"{rho:.4f} (off by {err:.3e})")
+    return "PASS", (f"rho={rho:.1f} kg/m^3 -> p_mass={applied:.6e} kg "
+                    f"(vendored default would be {vendored:.6e}, "
+                    f"{100*(vendored/applied - 1):+.1f}%); "
+                    f"round-trips through material_params to {float(rho_back):.4f}")
+
+
 # ---------------------------------------------------------------------------
 
 print("=" * 72)
