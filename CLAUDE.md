@@ -46,6 +46,7 @@ python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episod
 python src/synthetic_traj.py --out data_synth/ --kinds all
 python host/smoke_test_mpm.py                       # 16 checks, §9.4; ~10s first run
 python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
+python host/substep_study.py --frames 60            # §9.6; ~3 min, both materials
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
@@ -203,6 +204,30 @@ each. What you need to know before touching it:
 - **Subset metrics are bounded, not equated.** Exposure over a subset can only
   be ≥ the logged full-set value (removing particles removes occluders); peak
   stretch can only be ≤ it. Demanding equality rejected correct data.
+
+### The substep is a STABILITY bound, not a converged one (§9.6)
+
+`host/substep_study.py` swept `n_substeps` over a factor of 32 at both collected
+materials. What it settled:
+
+- **`safety = 0.3` is kept, and is a good stability bound.** The only rows that
+  diverged were above `safety ≈ 1.2`, so 0.3 carries a factor-of-four margin.
+- **Nothing converges under substep refinement, and nothing can.** MPM's
+  particle-grid transfers dissipate energy *per transfer*, not per unit of
+  simulated time, so halving the substep doubles the transfers inside the same
+  frame and roughly doubles the damping. Kinetic energy at a fixed simulated
+  time fell 296× (soft λ) and 9× (stiff λ) across the sweep, monotonically.
+  Refining `dt` at fixed `dx` over-damps instead of converging. **Do not "just
+  run it finer"** — that burns GPU time on a sweep that cannot settle.
+- **`safety_strain` is therefore not a material property under this solver.** It
+  moved by 2.3–3.2× across the sweep, and the collector picks substeps *per
+  material*, so `data_mpm/`'s two episodes carry different amounts of numerical
+  damping and their safety numbers **are not comparable to each other**. Carry
+  this into any training that conditions on material.
+
+A real MPM convergence study refines `dx` and `dt` together, which changes the
+particle count. Not attempted. §4's PyBullet study is still unrun and still
+applies there, where there is no particle-grid transfer.
 
 ### Next: the robot
 
