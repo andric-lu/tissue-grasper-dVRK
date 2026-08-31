@@ -1799,10 +1799,203 @@ vendored tree.
   episode in `data_mpm/`.
 
 ---
-## 10. Files
+## 10. Session 4 — 31 August 2026: the PSM lands
+
+Every MPM episode before this section was passive gravity settling —
+`_init_solver()` hand-bound `SDF`/`collision_mask` to empty space because
+there was no robot. This section replaces that with a real, moving,
+colliding tool: `psm_Si_model/psm_si_surrol.urdf`, a dVRK **Si**-variant PSM
+(13 links), driven kinematically through `host/psm.py` and wired into
+`host/mpm_adapter.py`'s `record_grasp_episode()`.
+
+### 10.1 The plan was sent back once, and the correction caught four real bugs
+
+The first design draft was reviewed before any code was written and rejected
+with nine specific, technical objections. Four of them were not style
+notes — they were bugs that would have shipped silently:
+
+1. **The proxy collision-frame design was wrong.** The draft planned to fold
+   the jaw mesh's AABB offset into PyBullet's `collisionFramePosition` and
+   let the solver "just work." `sdf.py`'s box path reads only
+   `p.getCollisionShapeData(...)[0][3]` — the shape's extents — and **never**
+   reads a collision shape's local frame offset. The box's assumed world
+   pose is entirely whatever `i_rot_list`/`i_pos_list` the caller supplies;
+   an offset placed via `collisionFramePosition` would have been silently
+   invisible to the SDF math while still being a real geometric fact about
+   the body. Fixed by building each proxy as a zero-offset box and composing
+   `T_world_box = T_world_jaw . T_jaw_box` by hand, in numpy, every frame.
+2. **Both jaws would have shared one collision velocity**, derived from the
+   single commanded EE-pose delta. Jaw closure moves the two jaws
+   differently from each other and from the EE frame; a shared velocity was
+   wrong for both. Fixed by finite-differencing each proxy's own
+   `T_world_box` across consecutive recorded frames, independently.
+3. **The IK joint-index mapping was wrong.** `p.calculateInverseKinematics`
+   returns one value per **movable** joint (fixed joints skipped entirely),
+   in increasing raw-joint-index order — not one value per raw joint index.
+   The draft would have read IK's output at the wrong offset for every joint
+   after the first fixed one in the chain. Fixed by resolving a
+   `movable-index -> raw-index` map once, at construction.
+4. **The design was about to fabricate `CONTACT_GRASP`.** The schema defines
+   `CONTACT_GRASP` as tissue **kinematically attached** to the tool.
+   `Boundary()`'s collision branch (`mpm3d.py:241-249`) is an unconditional
+   zero-slip velocity constraint with no persistence — the friction/slip code
+   is commented out ("sticky trick"), and a particle leaving the SDF radius
+   is released immediately, no bookkeeping holds it. That is mechanically
+   `CONTACT_STICK`, never `CONTACT_GRASP`. The draft's plan to label
+   jaw-closed-and-near as `CONTACT_GRASP` — manufactured specifically to make
+   `check_grasp_is_consistent` stop warning — is exactly the kind of check-
+   gaming this project's own validation discipline exists to catch. Every
+   episode from this path emits only `NONE`/`TOUCH`/`STICK`; `grasp_active`
+   is always `False`, `grasp_node_ids` always empty, and
+   `check_grasp_is_consistent` keeps WARNing on every episode, honestly,
+   until real persistent attachment is built.
+
+The remaining five corrections fixed the PyBullet client lifecycle (`sdf.py`'s
+calls carry no `physicsClientId`, so there can be exactly one live client per
+process — no injectable client parameter), the `init_pos()`/`MPMRecorder`
+construction ordering (a `PSM` cannot exist before `MPMRecorder.__init__` has
+already imported and `ti.init()`'d `MPM.mpm3d`), the exact state/action
+timing contract (row *t*'s `ee_pose`/`action` are the commanded/analytic
+waypoint, never the IK-achieved pose — kept separate so "applying row *t*'s
+action reproduces row *t+1*'s recorded state" is exact, not approximate),
+the `grasp_node_ids` indexing spec for whenever real attachment lands
+(recorded-subset indices, not full-solver indices — the visualizer uses them
+directly against `tissue_pos`), and required provenance for the 16 MB asset
+tree before committing it (`psm_Si_model/PROVENANCE.md`).
+
+### 10.2 The vendored solver's collision path has one hard, undocumented trap
+
+Read directly from `third_party/MPM/sdf.py` and `mpm3d.py`, not assumed:
+
+- **`MAX_COLLISION_OBJECTS = 3`** (`mpm3d.py:26`), compile-time-sized. At most
+  3 simultaneous colliders without editing the vendored solver. This episode
+  uses 2 (the jaw links) plus one permanently-inert dummy far outside the
+  domain, placed once and never moved — every `co_obj` slot is queried
+  unconditionally every step, so an unused slot still needs a real body.
+- **A `co_obj` slot with `link_id == -1`** — PyBullet's "base" convention —
+  makes `sdf.py` take the "needle" precomputed-SDF path
+  (`static_sdf[idx]`). Nothing in this repository ever calls
+  `sdf.init_static_sdf(...)`, so `static_sdf` sits at Taichi's zero default:
+  every in-range grid node would read distance 0.0, a phantom zero-distance
+  surface across the whole domain, the instant that slot is queried. Every
+  proxy in `host/psm.py` is therefore built as a **one-link** multibody
+  (`link_id = 0`), never a bare base — this is the single most important
+  invariant in the file, and `host/smoke_test_psm.py` asserts it directly.
+- **`sdf.position`** (the grid field the collision kernel transforms) is only
+  populated by `mpm3d.init_pos()`. `MPMRecorder._init_solver()` never called
+  it, because it never needed the collision path before. Owned by
+  `PSM.__init__` now, once, and only there — not duplicated into
+  `_init_solver()`, which stays unchanged whether or not a robot exists.
+- **Taichi's Metal backend has no f64 primitive type.** The first real run
+  failed at `reverse_rotation_matrix.from_numpy(i_rot)` with
+  `RuntimeError: Type f64 not supported` — `numpy`'s default float dtype is
+  float64, and `.from_numpy()` goes through a compiled kernel that requires
+  the array's dtype to match the field's, unlike plain `field[i] = ...`
+  assignment, which casts silently. Every array fed to
+  `switch_reference_frame_and_update_sdf` is explicitly `float32` now. Not
+  predicted by the design review — found by running it, on the first attempt.
+
+### 10.3 What was built
+
+- **`psm_Si_model/`** — the URDF (13 links: `link_0 -j1-> link_1`, then two
+  branches off `link_1`: `-j4->` the real tool chain to
+  `tool_gripper_center`, and `-j2->link_2-j3->link_3`, the dVRK's decorative
+  parallelogram linkage, confirmed **not** an ancestor of the tool from the
+  URDF's own `<parent>`/`<child>` tags) plus all referenced mesh assets.
+  `PROVENANCE.md` records sha256 for all 122 files; **source and license are
+  still an open TODO**, filled in with a placeholder pending confirmation —
+  the URDF's own header comments point at a `ros2_dvrk_model`-style package
+  and a personal development path, not a confirmed upstream.
+- **`host/psm.py`** — the `PSM` class: URDF load (`useFixedBase=True`,
+  required since `link_0`'s world-fixed joint is commented out in the URDF),
+  movable-DOF-correct IK with a post-solve residual gate (raises past 2 mm /
+  0.02 rad — an unreachable target fails loudly, not silently), jaw proxy
+  construction and per-frame `T_world_box` composition, per-proxy
+  finite-difference collision velocity with sweep-limit assertions
+  (0.5·dx translation, 0.2 rad/frame rotation), `workspace_aabb()` for
+  calibration. `j2`/`j3` pinned to 0; the only enforced `<mimic>` is
+  `jaw_joint_2 = -jaw_joint_1` (PyBullet has no native `<mimic>` support).
+- **`host/mpm_adapter.py`** — `record_grasp_episode()`, a scripted
+  approach → close → retract (no planner), plus `capture()`/`advance()`
+  changes to carry `joint_pos`/`grasp_active`/`grasp_node_ids` and to refresh
+  collision geometry once per recorded frame (matching the vendored
+  `step()`'s own cadence) rather than once per substep. `--task
+  {settle,grasp}` added to `main()`; `settle` is the unchanged default.
+- **Base placement** (`psm.DEFAULT_BASE_POSITION`/`ORIENTATION`) was picked
+  empirically, not derived — the chain has too many compounded rotated
+  offsets (`j1`'s own origin alone translates 0.834 m along a rotated axis)
+  to hand-derive. `workspace_aabb()` at the chosen placement (500 samples)
+  gives `x∈[0.006,0.516], y∈[0.117,0.564], z∈[-0.058,0.445]` domain-metres,
+  comfortably containing the tissue's spawn region
+  (`x∈[0.1,0.4], y∈[0.2,0.5], z∈[0.05,0.10]`, `init_cube()`), on the first
+  placement tried.
+- **Contact threshold, measured not inherited.** Jaw half-extents came out to
+  ~6–9 mm — smaller than one grid cell (`dx=15.6 mm`). The vendored default
+  `threshold=0.05` (5 cm) would have extended the contact "halo" roughly two
+  grid cells beyond the jaw's true surface. `record_grasp_episode()` uses
+  `threshold=0.02` (2 cm) instead — documented, deliberately tighter, the
+  safe direction to be wrong in for a sticky-contact collider.
+
+### 10.4 Verification
+
+`host/smoke_test_psm.py`, 19 checks in the same idiom as
+`smoke_test_mpm.py`, split into a shared-PSM phase (nothing that calls
+`substep()`) and a real-episode phase (`record_grasp_episode()` run once,
+inspected). Three of the 19 directly reproduce the bugs §10.1 caught, run
+against fixed versions and confirmed they'd catch the original mistake:
+the three-way AABB/live-proxy-AABB/SDF-argmin consistency check (would have
+caught the `collisionFramePosition` bug — two independently-computed poses
+could agree while both being wrong, but the SDF's own minimum cannot),
+per-proxy velocity independence (would have caught the shared-EE-delta
+bug), and an independent geometric recomputation of `contact_mode` from
+`joint_pos` alone, matching all 50 recorded frames of a real episode exactly
+— not inferred from aggregate tissue motion, which is confounded by
+ordinary gravity settling that happens with or without the tool nearby.
+
+```
+pytest tests/ -q                                        278 passed, 1 skipped
+python host/smoke_test_psm.py                            19 passed, 0 failed
+python host/mpm_adapter.py --task grasp --out data_mpm_grasp --episodes 2 --steps 50
+python host/validate_dataset.py --data data_mpm_grasp/    0 failed, 4 WARN (honest)
+```
+
+The two WARNs on every grasp episode are both expected, not regressions:
+`grasp is consistent` ("grasp never active in this episode" — §10.1 point 4,
+by design) and `F incompressible` (a pre-existing material-model property,
+unrelated to this section). Dataset-wide checks over the two episodes
+**PASS**: `deformation is diverse` (peak displacement 33.1–34.9 mm, 3%
+spread) and `material is diverse` (μ spans 2112–3758 Pa). A real episode
+shows tissue displacement up to 8.6 mm attributable to the tool, and
+`contact_mode` stages cleanly `NONE → TOUCH → STICK → TOUCH → NONE` across
+approach/close/retract with no direct `NONE → GRASP` jump — because `GRASP`
+never appears.
+
+### 10.5 Still open
+
+- **Trocar-pivot (RCM-constrained) motion.** The URDF's `RCM` link exists
+  (a visual-only sphere) but nothing constrains the tool through it; IK is
+  free-space 6-DOF. A real trocar constraint needs either a nullspace/
+  secondary-objective IK term or a reduced action parameterization.
+- **Persistent grasp attachment.** The precise spec for `grasp_node_ids`
+  indexing (recorded-subset indices via `np.searchsorted(particle_ids, ...)`,
+  never full-solver indices) is written down in `host/mpm_adapter.py`'s
+  `_contact_mode()` docstring for whenever this lands; not implemented here.
+- **`psm_Si_model/PROVENANCE.md`'s source/license fields are still TODO.**
+  Blocks nothing technically, but should be resolved before this asset is
+  treated as a permanent part of the repository's history.
+- **§4 remains untouched.** The PyBullet/container track and
+  `container/timestep_study.py` are unrelated to this section and still
+  unrun.
+- **Material ranges are still placeholders** (`materials.py`). The two grasp
+  episodes collected here are a pipeline demonstration, not a claim about
+  real tissue response to grasping.
+
+---
+## 11. Files
 
 Every path below was checked against the repository on 17 August 2026; the
-four §9.7 rows were added on 26 August 2026.
+four §9.7 rows were added on 26 August 2026; the `psm_Si_model`/`psm.py`/
+`smoke_test_psm.py` rows were added on 31 August 2026 (§10).
 
 **Correction.** Earlier versions of this table listed files that had been written
 during a session but never saved to disk. `container/validate_physics.py` was one
@@ -1840,7 +2033,10 @@ copy is the shareable view, not the only copy.
 | `host/smoke_test_mpm.py` | macOS | MPM smoke test, 16 checks | §9.4, §9.5, **16/16** |
 | `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
 | `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
-| `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5 |
+| `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5, §10 |
+| `psm_Si_model/` | — | dVRK Si PSM URDF + meshes; source/license still TODO | §10.1, §10.3 |
+| `host/psm.py` | macOS | PSM: IK, jaw proxy colliders, SDF/co_v/co_w sync | §10 |
+| `host/smoke_test_psm.py` | macOS | PSM smoke test, 19 checks | §10.4, **19/19** |
 | `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run**; its dissipation verdict is superseded by §9.7 |
 | `src/energy_ledger.py` | **both** | Closed mechanical-energy budget, exponent fit, verdict | §9.7 |
 | `host/mpm_energy.py` | macOS | Instrumented MPM driver: split kernels, grid probes, known ICs | §9.7 |
@@ -1863,7 +2059,7 @@ copy is the shareable view, not the only copy.
 
 ---
 
-## 11. References
+## 12. References
 
 - Xu et al., *SurRoL*, IROS 2021 — [arXiv:2108.13035](https://arxiv.org/abs/2108.13035)
 - *Efficient Physically-based Simulation of Soft Bodies in Embodied Environment for Surgical Robot* — [arXiv:2402.01181](https://arxiv.org/abs/2402.01181)
