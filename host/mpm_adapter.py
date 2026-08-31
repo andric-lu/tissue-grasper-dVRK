@@ -213,16 +213,35 @@ class MPMRecorder:
         # with the same stiffness but a different density run silently at the
         # first episode's mass -- the identical failure mode, minus the error
         # message.
+        # GRAVITY IS THE THIRD BAKED CONSTANT. Boundary() reads it as a plain
+        # Python global inside a @ti.func (`F_grid_v[I][2] -= dt * gravity`,
+        # mpm3d.py:215), so it is frozen at compile time by the same mechanism
+        # as dt and p_mass. The adapter never changes it -- but host/mpm_energy.py
+        # does, because section 9.7's clean cell needs g = 0, and both import the
+        # same module object. A lock covering only two constants would let a
+        # collection run that happened to follow an energy-audit run in one
+        # interpreter record a full dataset of tissue that never fell.
+        self.gravity = float(mpm3d.gravity)
+        if self.gravity != 9.8:
+            raise RuntimeError(
+                f"mpm3d.gravity is {self.gravity}, not 9.8 m/s^2. Something in "
+                "this process changed it before collection started (see "
+                "host/mpm_energy.py). Collect in a fresh interpreter.")
+
         locked = getattr(mpm3d, "_adapter_compile_lock", None)
         if locked is not None:
-            l_dt, l_mass = locked
-            if abs(l_dt - self.substep_dt) > 1e-15 or abs(l_mass - mpm3d.p_mass) > 1e-30:
+            l_dt, l_mass, l_g = locked
+            if (abs(l_dt - self.substep_dt) > 1e-15
+                    or abs(l_mass - mpm3d.p_mass) > 1e-30
+                    or l_g != self.gravity):
                 raise RuntimeError(
                     f"this process already compiled MPM kernels with substep "
-                    f"dt={l_dt:.3e} s and p_mass={l_mass:.6e} kg, and Taichi "
-                    f"bakes both constants in at compile time; this episode "
-                    f"needs dt={self.substep_dt:.3e} s and "
-                    f"p_mass={mpm3d.p_mass:.6e} kg. Collect one episode per "
+                    f"dt={l_dt:.3e} s, p_mass={l_mass:.6e} kg and "
+                    f"gravity={l_g} m/s^2, and Taichi bakes all three constants "
+                    f"in at compile time; this episode needs "
+                    f"dt={self.substep_dt:.3e} s, "
+                    f"p_mass={mpm3d.p_mass:.6e} kg and gravity={self.gravity}. "
+                    "Collect one episode per "
                     "process -- `--episodes N` does this by launching a child "
                     "per episode; calling MPMRecorder twice in one interpreter "
                     "does not.")
@@ -233,7 +252,8 @@ class MPMRecorder:
         # timebase. `advance()` uses self.n_substeps, not this.
         mpm3d.steps = self.n_substeps
         mpm3d.timestep = self.n_substeps * self.substep_dt
-        mpm3d._adapter_compile_lock = (self.substep_dt, mpm3d.p_mass)
+        mpm3d._adapter_compile_lock = (self.substep_dt, mpm3d.p_mass,
+                                       self.gravity)
 
         backend = str(ti.lang.impl.current_cfg().arch)
         if "metal" not in backend.lower():

@@ -1373,7 +1373,18 @@ its total and its horizontal error is larger, but the stiff material's vertical
 error is 61.71% — far too large to be explained by a term that never touches z.
 The hypothesis survived contact with one column and died against the other.
 
-The actual cause is **numerical dissipation in the particle-grid transfers**, and
+> **WITHDRAWN 26 August 2026 — see §9.7.** Everything from here to the end of
+> this subsection is wrong. The mechanism below was inferred from kinetic energy
+> alone, in a configuration with gravity and floor contact both active, at a
+> time by which the body has already settled — so the two KE numbers being
+> compared are both residual jitter near zero. Measured against a closed energy
+> budget in this same configuration, dissipation *falls* as the substep shrinks
+> (by 2.1× at the stiff material across a 16× ladder) and the positions *do*
+> converge, at an observed order of about 0.3. The paragraphs below are kept
+> rather than deleted because the reasoning that produced them is the thing
+> worth being able to re-read.
+
+The claimed cause is **numerical dissipation in the particle-grid transfers**, and
 the probe that identifies it is kinetic energy at a fixed simulated time:
 
 | | soft-λ | stiff-λ |
@@ -1397,6 +1408,13 @@ dissipation per transfer, and shrinking `dt` alone only buys more transfers. A
 genuine MPM convergence study must refine `dx` and `dt` **together**, which is a
 different and much more expensive experiment, and one that changes the particle
 count and therefore the schema.
+
+> **END OF THE WITHDRAWN ARGUMENT (§9.7).** The classical instrument does apply:
+> a `dt` refinement at fixed `dx` converges here, slowly. The zero-stiffness test
+> in §9.7 — where nothing but the transfers can act — holds total loss constant
+> to 0.2% across a factor of 64 in `dt`, which is the direct refutation. The
+> stability half of this section, and its finding that `safety_strain` is not
+> comparable between episodes, are unaffected and stand.
 
 #### The consequence that actually matters for the dataset
 
@@ -1460,7 +1478,8 @@ different lumps of material.
   question of PyBullet, where the classical instrument *does* apply, because
   PyBullet's soft body has no particle-grid transfer.
 - **A real MPM convergence study** — refining `dx` and `dt` together — has not
-  been attempted and would change the particle count.
+  been attempted and would change the particle count. (§9.7: it is no longer the
+  *only* valid instrument, but it is still the right one for a spatial claim.)
 - **The `*= 0.1` floor friction is still a defect** in the vendored solver, now
   documented. It is not the dominant error here but it is dt-dependent and
   should be fixed or replaced with a dt-scaled law before anything depends on
@@ -1468,9 +1487,322 @@ different lumps of material.
   tree is unmodified; fixing this means editing it and saying so there.
 
 ---
+### 9.7 The energy audit: §9.6's mechanism was wrong, and its probe was the reason
+
+26 August 2026. `host/energy_audit.py`, `host/mpm_energy.py`,
+`src/energy_ledger.py`.
+
+§9.6 concluded that MPM's particle-grid transfers dissipate energy *per
+transfer* rather than per unit of simulated time, and therefore that refining
+the substep at a fixed grid cannot converge. That became load-bearing
+immediately: CLAUDE.md tells future work not to refine, and §9.6 used it to
+declare `safety_strain` non-comparable between episodes.
+
+**It is wrong.** Measured against a closed energy budget, in §9.6's own
+configuration, dissipation *falls* as the substep shrinks and the particle
+positions *do* converge. The per-transfer mechanism is not what the sweep was
+showing, and the reason it looked that way is the probe.
+
+#### Why the original probe could not carry the claim
+
+§9.6's evidence is one number: specific kinetic energy of a 3,000-particle
+subset at a fixed simulated time, falling monotonically across the sweep
+(`substep_study.py:216`). Four things are wrong with it, and the fourth is
+fatal on its own.
+
+1. **Kinetic energy is not the energy budget.** The rows settle under gravity,
+   so KE is pumped by gravitational release and drained by contact, elasticity
+   and the transfers simultaneously. A lower KE is as consistent with "settled
+   sooner" as with "damped harder".
+2. **Contact was live in every row.** The `*= 0.1` band and the `bound = 3`
+   wall condition were both firing, so nothing in the sweep isolated the
+   transfers at all.
+3. **The finest row was the reference**, while being — by §9.6's own argument —
+   the most over-damped row in the table.
+4. **At T the body has already settled, so the probe was comparing two numbers
+   that are both essentially zero.** This is the one that ends the argument.
+   Under the full ledger, KE at T in the §9.6 configuration is 8e-5 J at the
+   coarsest row and below 1e-5 J at every finer one, out of a total of 8.0 J.
+   §9.6's 296× and 9× ratios are ratios between residual jitter of a body at
+   rest. They measure how fast each row stopped moving, not how much energy it
+   destroyed.
+
+#### The instrument
+
+`src/energy_ledger.py` computes the closed budget over **all** 24,000 particles
+in float64:
+
+    E = KE_particle + KE_affine + Psi_elastic + PE_gravity
+
+Two properties make it exact rather than indicative, and both are checked:
+
+- **The energy already in the repository is the exact conjugate of the
+  solver's stress.** `tissue_metrics.strain_energy_neohookean` is
+  Psi = (mu/2)(I1-3) - mu·lnJ + (lambda/2)(lnJ)^2, and (dPsi/dF)F^T =
+  mu(FF^T - I) + lambda·lnJ·I, which is character for character `mpm3d.py:165`.
+  Verified by numerical differentiation in `tests/test_mpm_energy.py`, together
+  with the demonstration that perturbing lambda makes the identity fail. That
+  test did not exist before and the identity had only ever been asserted by
+  reading the two lines side by side.
+- **The APIC affine term is included.** Each particle carries
+  v_p + C_p(x - x_p); the energy in C is real and invisible to any sum over
+  `F_v`. D = (dx^2/4)I is derived from the solver's own quadratic weights
+  rather than quoted, and the derivation is a test.
+
+`host/mpm_energy.py` drives the vendored solver. It splits `substep()` into its
+three phases by calling `P2G`, `Boundary` and `G2P` — already `@ti.func` — from
+three kernels of our own, which opens observation points on the grid without
+editing `third_party/`. `PROVENANCE.md` still reads "None yet" and the four
+SHA-256s still match `cb797f36`.
+
+**Gravity is a third compile-time constant.** `Boundary()` reads it as a plain
+Python global inside a `@ti.func` (`mpm3d.py:215`), so it is baked exactly like
+`dt` and `p_mass`. §9.5's compile lock covered two of the three; it now covers
+all three, and `mpm_adapter` refuses outright to collect in a process where
+gravity is not 9.8.
+
+#### D1: the instrument was gated before anything was read from it
+
+Five checks, all of which must pass before the cells run:
+
+```
+[PASS] gravity_off            max|v| after one frame from rest = 0.000e+00 m/s
+[PASS] rigid_translation      relative energy change +4.5e-07 (stress is exactly zero)
+[PASS] affine_velocity        relative energy change +2.7e-07 (zero stiffness; APIC is exact)
+[PASS] split_matches_solver   fused-vs-split 3.0 ulp, solver's own floor 3.0 ulp
+[PASS] boundary_inert_in_clean_cell   worst boundary energy change 2.1e-08 of grid KE
+```
+
+The last one is the honest form of "contact and friction work": in the clean
+cell it is not estimated, it is shown to be zero. The fourth is the more
+interesting: **this solver is not bitwise reproducible against itself on
+Metal.** Two runs of the *vendored* `substep()` from a byte-identical state
+differ by ~1 ulp after 24 substeps, because P2G scatters into the grid with
+atomic adds and the summation order varies between launches. A bit-identity
+check would have failed forever for a reason unrelated to the split, so the
+noise floor is measured in the same process and the split is held to it.
+
+#### The zero-stiffness transfer test: the sharpest form of the question
+
+With `mu = lambda = 0` no force acts on anything. Particles advect and their
+velocity field is repeatedly filtered through the grid, so any energy that
+disappears is transfer loss and nothing else — and with no stress there is no
+CFL condition, so `dt` can be swept over decades.
+
+```
+ n_sub    substep  transfers         E(0)         loss  loss/transfer
+     4   3125.0us         16 7.209437e-03  3.77957e-03    2.36223e-04
+    16    781.2us         64 7.209437e-03  3.78365e-03    5.91195e-05
+    64    195.3us        256 7.209437e-03  3.78514e-03    1.47857e-05
+   256     48.8us       1024 7.209437e-03  3.78560e-03    3.69687e-06
+```
+
+**The total loss is constant to 0.2% across a factor of 64 in `dt`.** Loss per
+transfer falls by exactly 64×. If dissipation counted transfers, the loss column
+would have risen 64-fold; it did not move. This alone refutes the mechanism, in
+the cleanest possible setting, and it costs four short runs.
+
+Why the naive picture fails: the transfer destroys the non-affine content of the
+velocity field inside a cell, and what *regenerates* that content between
+transfers is inter-transfer motion of size |v|·dt. Halving `dt` doubles the
+transfers but quarters what each one has left to remove.
+
+#### The three cells
+
+`T = 0.75 s` (60 frames × 12.5 ms), the ladder is 0.5× to 8× the P-wave
+advisory count, both collected materials, one process per row.
+
+The verdict is the exponent q in (dissipation over fixed T) ~ dt^q, fitted on
+the **decay constant** k = -ln(E(T)/E(0))/T rather than the loss fraction. A
+fraction of E(0) cannot exceed 1 and the clean cell reaches 78%, so the ceiling
+would squeeze the exponent toward zero — toward this study's own conclusion,
+which is the one direction it must not be biased. Where nothing is saturated the
+two agree to two decimals (cell 4: +0.097 vs +0.095, +0.266 vs +0.264).
+
+| cell | material | q | verdict | measured across the 16× ladder |
+|---|---|---|---|---|
+| 1 clean | soft-λ | **-0.337** | INTERMEDIATE | 2.5× (per-transfer predicts 16×) |
+| 1 clean | stiff-λ | **-0.205** | INTERMEDIATE | 1.8× |
+| 3 band | soft-λ | **-0.068** | RATE_LIKE | 1.2× |
+| 3 band | stiff-λ | **+0.237** | INTERMEDIATE | 1.9× (r² = 0.68, non-monotone) |
+| 4 §9.6 | soft-λ | **+0.097** | RATE_LIKE | 1.3× |
+| 4 §9.6 | stiff-λ | **+0.266** | INTERMEDIATE | 2.1× |
+
+**Not one cell is near q = -1.** The pre-registered hypothesis predicted the
+dissipation would change by the full span of the ladder, 16×. The largest
+change measured anywhere is 2.5×, and in half the cells it goes the other way.
+
+#### Cell 4 is the one that settles it, because it is §9.6's own configuration
+
+```
+   n_sub    substep        E(0)        E(T)  dissipated    frac
+      12   1041.7us     8.45575     7.98641     0.46934   5.55%
+      24    520.8us     8.45575     8.02540     0.43035   5.09%
+      48    260.4us     8.45575     8.05553     0.40021   4.73%
+      96    130.2us     8.45575     8.07779     0.37796   4.47%
+     192     65.1us     8.45575     8.09533     0.36042   4.26%   (soft-lambda)
+
+      53    235.8us     8.54264     8.32707     0.21558   2.52%
+     106    117.9us     8.54264     8.36315     0.17949   2.10%
+     212     59.0us     8.54264     8.39284     0.14981   1.75%
+     424     29.5us     8.54264     8.41594     0.12670   1.48%
+     848     14.7us     8.54264     8.43984     0.10281   1.20%   (stiff-lambda)
+```
+
+**Dissipation falls monotonically with refinement, by 2.1× at the stiff
+material.** §9.6 says it roughly doubles at every halving of the substep. The
+measurement moves in the opposite direction, in the configuration §9.6 ran.
+
+And the positions converge:
+
+```
+          pair     RMS diff  as % of disp   order p
+        53/106     0.5438mm        21.26%         -
+       106/212     0.4360mm        20.28%      0.32
+       212/424     0.3715mm        20.34%      0.23
+       424/848     0.2873mm        18.23%      0.37
+```
+
+Successive differences shrink monotonically at a consistent observed order of
+about 0.3. That is slow — it is not the first-order convergence one would want —
+but "nothing converges under substep refinement, and nothing can" is false.
+
+#### Why §9.6's KE probe pointed the wrong way
+
+The term breakdown at T, from the same runs, with §9.6's probe as one column:
+
+```
+   n_sub          KE   KE_affine     elastic     PE_grav       TOTAL
+      12     0.00008     0.00000     0.17121     7.81512     7.98641
+      24     0.00002     0.00000     0.15865     7.86673     8.02540
+      48     0.00000     0.00000     0.15323     7.90230     8.05553
+      96     0.00000     0.00000     0.15029     7.92750     8.07779
+     192     0.00000     0.00000     0.14854     7.94679     8.09533
+```
+
+KE falls across the ladder, exactly as §9.6 reported. The total rises. What
+actually happens as the substep shrinks is that **less** energy is destroyed, so
+the slab sinks **less** far into the floor — `PE_grav` at T rises from 7.815 to
+7.947 J — and being less compressed it stores less strain energy, 0.171 down to
+0.149 J. §9.6 observed that the tissue deforms less at every refinement and that
+part is real; it attributed it to more damping when the cause is less.
+
+Cell 1 makes the same point from the other side: there KE at T *rises* with
+refinement (0.068 → 0.219 J) while elastic energy falls (0.496 → 0.073 J) and
+the total falls. KE tracks the phase of the oscillation, not the dissipation.
+**In neither cell does KE alone have the sign of the energy loss.**
+
+#### The floor band: right conclusion, wrong reason, and now measured
+
+§9.6 dismissed the `*= 0.1` band because it touches `[0]` and `[1]` and never
+`[2]`, while the stiff material's vertical error was the largest in the sweep.
+That reasoning is unsound: at λ/μ = 754 the material is nearly incompressible,
+so suppressing lateral flow at the base suppresses vertical settling almost
+rigidly, and the material with the strongest coupling showing the largest
+vertical error is what the floor hypothesis *predicts*. The alternative reading
+was rejected using its own best evidence.
+
+Cell 3 arms the band alone — slab positioned so its lowest stencil node sits
+exactly on k = 3, gravity off, lateral velocity only — and settles it properly.
+The band removes 89–93% of the energy, which is enormous, but it removes the
+same amount whatever the substep: q = -0.068 at the soft material, per-second
+spread 1.05 across the whole ladder. **A 0.1× multiplier per substep is so
+aggressive that it saturates into a hard clamp at every substep count tested**,
+which makes it dt-independent rather than transfer-counting. §9.6's conclusion
+about the band stands; its argument for that conclusion does not.
+
+#### What this changes
+
+- **§9.6's mechanism paragraph is withdrawn.** Amended in place, with a pointer
+  here. `CLAUDE.md`'s "Nothing converges under substep refinement, and nothing
+  can" is replaced, and the comments at `substep_study.py:210` and `:353` — which
+  told the next reader not to spend GPU time refining — now say why that advice
+  was wrong.
+- **`safety = 0.3` is still kept, and still on stability grounds.** Nothing here
+  touches the divergence cliff at `safety ≈ 1.2`; §9.6's stability half is
+  unaffected and remains correct.
+- **`safety_strain` is still not comparable between `data_mpm/`'s two
+  episodes.** §9.6's most useful finding survives its mechanism being wrong.
+  The two episodes ran at 24 and 106 substeps per frame, dissipation *does*
+  vary with substep count — weakly, and in the opposite direction from what
+  §9.6 said, but it varies — and the collector chooses that count per material.
+  A model conditioned on material still partly fits the substep schedule.
+- **A conventional refinement study is valid here after all.** It converges at
+  order ~0.3, so it is expensive, but "the classical instrument does not apply"
+  was wrong. Whether to spend that GPU time is a separate decision.
+
+#### Recommendation, not implemented
+
+Pinning `n_substeps` dataset-wide (at the stiffest material's requirement) would
+make dissipation identical across episodes and restore comparability. It
+reverses the cost argument recorded in `mpm_adapter.main()`'s docstring — soft
+episodes become ~4× more expensive — and it is now a correctness argument rather
+than a convenience one. Recorded here; not done. This section is an audit.
+
+#### Four things this got wrong first, kept because they are the method
+
+- **`init_cube()` is not idempotent.** It draws from `ti.random()` and the RNG
+  advances, so a second call in one process lays out a *different* cloud. §9.5's
+  "the initial particle cloud is identical in every episode" is true only
+  because every episode is a fresh process, and false the moment two initial
+  conditions are built in one interpreter — which is what the selftest does. The
+  first probe of solver reproducibility reported a 0.35 m discrepancy that was
+  entirely this.
+- **The first affine-transfer check blamed APIC for the check's own bug.** It
+  set particle velocities to an affine field but left `F_C` at zero, which makes
+  the represented field piecewise *constant*; the transfer then legitimately
+  destroyed what it could not see, and it was reported as a 0.75% APIC fault.
+  With `F_C` set, conservation is 2e-7.
+- **`ledger()` charged the wrong material.** It read the Python-side `mu`
+  instead of the solver's live `ti.field`, so a runtime-zeroed stiffness still
+  accrued strain energy. Same class as §9.5's timebase: two numbers that agree
+  with everything except each other.
+- **The verdict function twice overstated its own result**, in the tool written
+  to catch overstatement. Its first band filed a measured q = -0.34 as
+  "dissipation is essentially independent of dt" while the decay rate had moved
+  2.5× across that ladder; then the degenerate-fit fallback relabelled a
+  q = +0.24 ladder as RATE_LIKE because the collapse diagnostic preferred "per
+  time". Both are the same error §9.6 made. The verdict now quotes the measured
+  factor against both predictions, and the r² gate may caveat or withdraw a
+  verdict but never substitute one. Regression tests for both.
+
+#### Verification
+
+```
+pytest tests/ -q                              279 passed (249 before, 30 new)
+python host/energy_audit.py --selftest        5/5, D1 gate
+python host/energy_audit.py --frames 60       304.9 s, three cells, both materials
+shasum -a 256 third_party/MPM/*.py            all four match PROVENANCE.md
+python host/smoke_test_mpm.py                 unchanged
+python host/validate_dataset.py --data data_mpm/   exit 0
+```
+
+The SHA check is the one worth repeating: the whole instrument works by calling
+the vendored `@ti.func`s from kernels of our own, and it has not touched the
+vendored tree.
+
+#### Still open
+
+- **§4 remains untouched.** `container/timestep_study.py` has still never run.
+  It now matters more, not less: the PyBullet side has no particle-grid
+  transfer, and the excuse that convergence studies do not apply to this class
+  of solver has just been removed.
+- **A coupled `dx`/`dt` study** is still unattempted, and still the right
+  instrument for a genuine spatial convergence claim. It is no longer the *only*
+  valid instrument.
+- **Order ~0.3 convergence is poor and unexplained.** A first-order scheme
+  should show p ≈ 1. The gap is a real question this study raises and does not
+  answer.
+- **The `*= 0.1` band is still a defect** — now measured, at 89–93% of the
+  energy in cell 3. It is dt-independent, so it is not a *convergence* problem,
+  but it is an enormous and physically arbitrary sink sitting under every
+  episode in `data_mpm/`.
+
+---
 ## 10. Files
 
-Every path below was checked against the repository on 17 August 2026.
+Every path below was checked against the repository on 17 August 2026; the
+four §9.7 rows were added on 26 August 2026.
 
 **Correction.** Earlier versions of this table listed files that had been written
 during a session but never saved to disk. `container/validate_physics.py` was one
@@ -1509,13 +1841,16 @@ copy is the shareable view, not the only copy.
 | `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
 | `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
 | `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5 |
-| `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run** |
+| `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run**; its dissipation verdict is superseded by §9.7 |
+| `src/energy_ledger.py` | **both** | Closed mechanical-energy budget, exponent fit, verdict | §9.7 |
+| `host/mpm_energy.py` | macOS | Instrumented MPM driver: split kernels, grid probes, known ICs | §9.7 |
+| `host/energy_audit.py` | macOS | Energy audit, 5 selftests + 3 cells, one child per row | §9.7, **run** |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |
 | `container/timestep_study.py` | Linux | Convergence study | **never run** (§4) |
 | `container/validate_physics.py` | Linux | Nine controlled physics experiments | **never run** |
-| `tests/` | macOS | 200 unit tests, four files | §8.7 |
+| `tests/` | macOS | 279 unit tests, five files | §8.7, §9.7 |
 
 **Data and artifacts** (git-ignored):
 

@@ -40,13 +40,15 @@ host-only — not a preference, the wheel does not exist (§9.3).
 ```bash
 # host
 conda activate tissue-host
-pytest tests/ -q                                    # 249 tests
+pytest tests/ -q                                    # 279 tests
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
 python host/smoke_test_mpm.py                       # 16 checks, §9.4; ~10s first run
 python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
 python host/substep_study.py --frames 60            # §9.6; ~3 min, both materials
+python host/energy_audit.py --selftest              # §9.7 D1 gate, ~40s
+python host/energy_audit.py --frames 60             # §9.7; ~5 min, 3 cells
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
@@ -199,35 +201,59 @@ each. What you need to know before touching it:
 - **The episode seed drives numpy only** — material and subset. `mpm3d.py` calls
   `ti.init()` with no `random_seed`, so the initial particle cloud is identical
   in every episode. Do not read "seed=N" as an independent initial condition.
+  That holds *per process only* — `init_cube()` advances the RNG, so calling it
+  twice in one interpreter gives two different clouds (§9.7).
 - **Metrics are computed over all 24,000 particles before subsampling**, because
   `safety_strain` is a maximum and a maximum over a subset is biased low.
 - **Subset metrics are bounded, not equated.** Exposure over a subset can only
   be ≥ the logged full-set value (removing particles removes occluders); peak
   stretch can only be ≤ it. Demanding equality rejected correct data.
 
-### The substep is a STABILITY bound, not a converged one (§9.6)
+### The substep is a STABILITY bound (§9.6), and refinement DOES converge (§9.7)
 
 `host/substep_study.py` swept `n_substeps` over a factor of 32 at both collected
-materials. What it settled:
+materials. `host/energy_audit.py` then re-ran the question against a closed
+energy budget and overturned half of what §9.6 concluded.
 
 - **`safety = 0.3` is kept, and is a good stability bound.** The only rows that
   diverged were above `safety ≈ 1.2`, so 0.3 carries a factor-of-four margin.
-- **Nothing converges under substep refinement, and nothing can.** MPM's
-  particle-grid transfers dissipate energy *per transfer*, not per unit of
-  simulated time, so halving the substep doubles the transfers inside the same
-  frame and roughly doubles the damping. Kinetic energy at a fixed simulated
-  time fell 296× (soft λ) and 9× (stiff λ) across the sweep, monotonically.
-  Refining `dt` at fixed `dx` over-damps instead of converging. **Do not "just
-  run it finer"** — that burns GPU time on a sweep that cannot settle.
-- **`safety_strain` is therefore not a material property under this solver.** It
-  moved by 2.3–3.2× across the sweep, and the collector picks substeps *per
-  material*, so `data_mpm/`'s two episodes carry different amounts of numerical
-  damping and their safety numbers **are not comparable to each other**. Carry
-  this into any training that conditions on material.
+  Unaffected by §9.7.
+- **§9.6's "nothing converges and nothing can" is WITHDRAWN.** It was inferred
+  from kinetic energy alone, under gravity and floor contact, at a time by which
+  the body has settled — so the two KE numbers compared are both residual jitter
+  near zero. Under the full budget, in that same configuration, dissipation
+  *falls* with refinement (2.1× across a 16× ladder at the stiff material) and
+  successive positions converge at observed order ≈ 0.3. The direct refutation
+  is the zero-stiffness test, where nothing but the transfers can act: total
+  energy loss is constant to **0.2% across a factor of 64 in `dt`**. Refining
+  `dt` at fixed `dx` is therefore a legitimate instrument here — just a slow and
+  expensive one.
+- **KE alone is not a proxy for dissipation, in either direction.** In §9.6's
+  configuration KE at T falls with refinement while the total *rises*; in the
+  clean no-contact cell KE rises while the total falls. Report the budget
+  (`src/energy_ledger.py`), never one term.
+- **`safety_strain` is still not a material property under this solver.** This
+  survives §9.7. Dissipation does vary with substep count — weakly, and in the
+  opposite direction from what §9.6 said — and the collector picks substeps
+  *per material*, so `data_mpm/`'s two episodes are **not comparable to each
+  other**. Carry this into any training that conditions on material.
+- **The `*= 0.1` floor band removes 89–93% of the energy** in a cell that arms
+  it alone (§9.7 cell 3), and does so essentially independently of `dt` — it is
+  so aggressive that it saturates into a hard clamp at every substep tested. Not
+  a convergence problem; an enormous arbitrary sink under every `data_mpm/`
+  episode.
 
-A real MPM convergence study refines `dx` and `dt` together, which changes the
-particle count. Not attempted. §4's PyBullet study is still unrun and still
-applies there, where there is no particle-grid transfer.
+A coupled `dx`/`dt` study is still unattempted and is still the right instrument
+for a *spatial* convergence claim. §4's PyBullet study is still unrun and now
+matters more, not less: the excuse that convergence studies do not apply to this
+class of solver has been removed.
+
+**Three constants are baked into Taichi kernels at compile time, not two:**
+`dt`, `p_mass` and **`gravity`** (`Boundary()` reads it as a Python global,
+`mpm3d.py:215`). One process per (dt, p_mass, gravity). Also: **`init_cube()` is
+not idempotent** — it draws from `ti.random()` and the RNG advances, so a second
+call in one interpreter lays out a *different* cloud. "Identical cloud in every
+episode" holds only because every episode is a fresh process.
 
 ### Next: the robot
 
