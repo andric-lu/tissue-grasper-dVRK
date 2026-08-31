@@ -206,13 +206,22 @@ def diagnose(path: str, frames: int) -> dict:
         "rms_disp_xy_m": float(np.sqrt((np.linalg.norm(
             pos[-1, :, :2] - pos[0, :, :2], axis=1) ** 2).mean())),
         "rms_disp_z_m": float(np.sqrt(((pos[-1, :, 2] - pos[0, :, 2]) ** 2).mean())),
-        # SPECIFIC KINETIC ENERGY, as a dissipation probe. MPM's particle-grid
-        # transfers lose energy PER TRANSFER, not per unit of simulated time, so
-        # halving the substep doubles the number of transfers in the same 12.5 ms
-        # and dissipates roughly twice as much. If that is what drives the
-        # substep dependence, KE at a fixed simulated time must fall as
-        # n_substeps rises. Mass is uniform across particles, so summing v^2 is
-        # proportional to KE and the constant cancels in any comparison.
+        # SPECIFIC KINETIC ENERGY. DO NOT READ THIS AS A DISSIPATION PROBE --
+        # section 9.7 showed it is not one, and this comment used to say it was.
+        #
+        # The original claim here was that MPM's transfers lose energy PER
+        # TRANSFER, so KE at a fixed simulated time falling as n_substeps rises
+        # identifies transfer dissipation. Both halves are wrong. KE is one term
+        # of the budget, not the budget; these episodes settle under gravity
+        # onto a floor, so by the end of the run KE is residual jitter near zero
+        # at every row and its ratios compare noise to noise. Measured against
+        # the closed budget in host/energy_audit.py, total dissipation in this
+        # very configuration FALLS as the substep shrinks, while KE falls too --
+        # they have opposite signs relative to the energy loss.
+        #
+        # Kept because it is what the dataset carries and it is cheap. Use
+        # host/energy_audit.py for anything about dissipation. Mass is uniform
+        # across particles, so summing v^2 is proportional to KE.
         "ke_final": float((np.linalg.norm(
             tr.tissue_vel.astype(np.float64)[-1], axis=1) ** 2).sum()),
         "ke_peak": float((np.linalg.norm(
@@ -349,14 +358,17 @@ def _assess(rows: list, n_adv: int, label: str) -> list:
                   "largest step that resolves this material.")
     else:
         print("  NOT CONVERGED at any tested substep coarser than the finest.")
-        # Before telling anyone to refine further, check whether refining CAN
-        # help. MPM's particle-grid transfers dissipate energy per TRANSFER,
-        # not per unit of simulated time, so halving the substep doubles the
-        # number of transfers in the same frame and roughly doubles the
-        # damping. Where that dominates, refinement does not approach a
-        # solution -- it walks steadily toward an over-damped one, and "extend
-        # the sweep downward" is advice that burns GPU time forever. The KE
-        # ratio is what distinguishes the two cases.
+        # WARNING: THE VERDICT BELOW IS WRONG, AND IS KEPT ONLY SO THAT ITS
+        # OUTPUT STAYS RECOGNISABLE AGAINST section 9.6'S TABLES. See section 9.7.
+        #
+        # It says that a monotone fall in KE identifies per-transfer
+        # dissipation, and therefore that refining further cannot help. The
+        # energy audit measured the closed budget in this same configuration
+        # and found the opposite: dissipation FALLS with refinement (2.1x
+        # across a 16x ladder at the stiff material) and successive positions
+        # converge at observed order ~0.3. Refining does help here; it is
+        # merely slow. Anyone reaching this branch should run
+        # host/energy_audit.py rather than believe the paragraph it prints.
         # MONOTONICITY, not magnitude. A ratio threshold is arbitrary and got
         # this wrong once: the two materials here fall 296x and 9x across the
         # same sweep, showing identical behaviour, and a 10x cutoff told one of
@@ -368,14 +380,15 @@ def _assess(rows: list, n_adv: int, label: str) -> list:
         if monotone_loss and len(ke) >= 3:
             print("  AND kinetic energy at a fixed simulated time falls "
                   f"{ratio:.0f}x across the sweep.")
-            print("  That is the signature of transfer dissipation, not of a "
-                  "solution being approached:")
-            print("  more substeps means more particle-grid round trips in the "
-                  "same frame, and each")
-            print("  one damps. Refining further will not converge -- it will "
-                  "go on quietly removing")
-            print("  energy. See DECISION_LOG.md 9.6 before spending GPU time "
-                  "on a finer sweep.")
+            print("  SUPERSEDED -- section 9.6 read that as per-transfer "
+                  "dissipation and section 9.7 showed")
+            print("  it is not. KE is one term of the budget, and by the end of "
+                  "these runs it is")
+            print("  residual jitter near zero at every row. Measured against "
+                  "the closed budget,")
+            print("  dissipation FALLS with refinement here and the positions "
+                  "converge at order ~0.3.")
+            print("  Run host/energy_audit.py, not a finer sweep of this one.")
         else:
             print("  Extend the sweep downward before trusting data collected "
                   "here.")
