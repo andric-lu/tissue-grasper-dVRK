@@ -135,6 +135,10 @@ chronological one. Both are in the repo and must stay there.
   `mpm_adapter.py`, validating clean. `data_mpm/stale/` keeps the two 17 August
   files as §9.5's evidence: they predate both the P-wave substep and the density
   fix, so they ran at ρ = 1000 whatever they record. Evidence, never a baseline.
+- **`data_mpm_grasp/` is gitignored and regenerable** — `--task grasp`
+  episodes (§10), a real PSM approach/close/retract. Two episodes validate
+  clean (0 FAIL); `grasp is consistent` WARNs honestly on both, by design —
+  see "The PSM" below before treating that WARN as a bug.
 - **The MLP is a placeholder.** MeshGraphNets is the target; the schema already
   carries `tissue_faces` / `tissue_tets`.
 
@@ -255,15 +259,60 @@ not idempotent** — it draws from `ti.random()` and the RNG advances, so a seco
 call in one interpreter lays out a *different* cloud. "Identical cloud in every
 episode" holds only because every episode is a fresh process.
 
-### Next: the robot
+### The PSM — landed, `--task grasp` episodes verified (§10)
 
-There is no PSM. `ee_pose` and `action` are whatever the caller passes and the
-tissue is driven by gravity alone, so every episode is passive settling —
-`grasp is consistent` WARNs on all of them, correctly. PyBullet supplies
-rigid-body collision through the SDF in `sdf.py`, and that is the seam. The
-adapter binds `SDF` and `collision_mask` by hand and fills the SDF large and
-positive, which is what lets the solver run with no scene at all; the PSM
-replaces exactly that.
+`psm_Si_model/psm_si_surrol.urdf` (dVRK Si variant, 13 links) is driven
+kinematically through `host/psm.py`'s `PSM` class and wired into
+`host/mpm_adapter.py`'s `record_grasp_episode()` (`--task grasp`, `--task
+settle` stays the unchanged passive default). `host/smoke_test_psm.py`
+passes 19/19. What it established that you need to know:
+
+- **A `co_obj` slot with `link_id == -1` is corruption, not a no-op.**
+  `sdf.py` takes the "needle" precomputed-SDF path for it, and nothing in
+  this repo ever calls `sdf.init_static_sdf(...)` — that field sits at
+  Taichi's zero default, a phantom zero-distance surface across the whole
+  domain. Every collider here is a one-link proxy body (`link_id = 0`),
+  never a bare base. `smoke_test_psm.py` asserts this directly.
+- **`sdf.py` never reads a collision shape's local frame offset**
+  (`collisionFramePosition`) — only `getCollisionShapeData(...)[0][3]`, the
+  extents. A box's world pose for the SDF is entirely whatever
+  `i_rot_list`/`i_pos_list` the caller supplies. `host/psm.py` composes
+  `T_world_box = T_world_jaw . T_jaw_box` by hand every frame; it does not
+  delegate the offset to PyBullet's own collision-frame machinery.
+- **The two jaws get independent collision velocity**, finite-differenced
+  from each proxy's own consecutive `T_world_box`, never derived from the
+  shared commanded EE-pose delta — jaw closure moves the two jaws
+  differently from each other and from the EE frame.
+- **`p.calculateInverseKinematics` returns one value per *movable* joint**
+  (fixed joints skipped), in raw-joint-index order — not one value per raw
+  joint index. `PSM` resolves a movable-index -> raw-index map once, at
+  construction. `set_ee_pose()` also validates the achieved pose against the
+  commanded one and raises past 2 mm / 0.02 rad residual.
+- **`mpm3d.init_pos()` is owned by `PSM.__init__`, once.**
+  `MPMRecorder._init_solver()` never calls it, robot or not — it populates
+  `sdf.position`, which only the collision path needs.
+- **Taichi's Metal backend has no f64 primitive.** Every array fed to
+  `switch_reference_frame_and_update_sdf` must be explicit `float32`;
+  `numpy`'s default float64 fails at the first `.from_numpy()` call with no
+  warning beforehand. Found by running it, not predicted.
+- **This solver has no persistent grasp.** `Boundary()`'s collision branch is
+  an unconditional, non-persistent zero-slip constraint — mechanically
+  `CONTACT_STICK`, never the schema's `CONTACT_GRASP` ("jaws closed, tissue
+  kinematically attached"). Every grasp episode emits only
+  `NONE`/`TOUCH`/`STICK`; `grasp_active` is always `False`,
+  `grasp_node_ids` always empty; `check_grasp_is_consistent` keeps WARNing,
+  honestly, until real attachment is built. **Do not label proximity as
+  `CONTACT_GRASP` to make that WARN go away** — a first design draft tried
+  exactly that and was rejected specifically for it.
+- **Jaw half-extents measured at ~6–9 mm**, smaller than one grid cell
+  (`dx=15.6 mm`). Collection uses `threshold=0.02`, not the vendored
+  default `0.05`, which would extend the contact halo roughly two grid
+  cells beyond the jaw's true surface.
+- **Base placement is empirical** (`psm.DEFAULT_BASE_POSITION`/
+  `ORIENTATION`), picked via `workspace_aabb()`, not derived — the chain has
+  too many compounded rotated offsets to hand-derive reliably.
+- **Trocar-pivot (RCM-constrained) motion is not implemented.** IK is
+  free-space 6-DOF; the URDF's `RCM` link is visual-only.
 
 Material ranges in `materials.py` are still placeholders, so no result should be
 claimed from a model trained on this data yet.

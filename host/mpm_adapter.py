@@ -83,10 +83,16 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "third_party"))   # so `import MPM.x` works
 sys.path.insert(0, os.path.join(REPO, "src"))
+sys.path.insert(0, os.path.join(REPO, "host"))           # so `import psm` works
 
+import actions                                            # noqa: E402
 import materials                                         # noqa: E402
 import tissue_metrics                                    # noqa: E402
 import trajectory_io                                     # noqa: E402
+import psm                                                # noqa: E402 -- imports
+# pybullet only, not taichi/MPM.mpm3d; safe at module load, before any
+# MPMRecorder exists. See psm.py's own module docstring for why a PSM
+# instance itself cannot be constructed this early.
 
 # Default number of particles to RECORD. The solver needs ~24,000 for stable
 # physics; MeshGraphNets trains on 1.5k-5k nodes. These are different numbers
@@ -404,8 +410,20 @@ class MPMRecorder:
         default (25) and has nothing to do with this episode's material; using
         it here is what made recorded frames advance the wrong amount of time
         while every number written to disk agreed with every other one.
+
+        If self.robot is set, collision geometry is refreshed ONCE per
+        recorded frame here -- not once per substep, matching the vendored
+        solver's own step()'s cadence -- against whatever pose the caller has
+        already driven the PSM to (see record_grasp_episode(): the PSM is set
+        to the frame's END target BEFORE advance() is called, so this reads
+        that end-of-frame transform and holds it constant across the frame's
+        substeps).
         """
         for _ in range(n_frames):
+            robot = getattr(self, "robot", None)
+            if robot is not None:
+                robot.update_collision_geometry(self.m, self.m.sdf)
+                robot.update_collision_velocity(self.m, self.frame_dt)
             for _ in range(self.n_substeps):
                 self.m.substep(scale, threshold)
         self.ti.sync()
@@ -416,6 +434,9 @@ class MPMRecorder:
 
     def capture(self, *, ee_pose: np.ndarray, action: np.ndarray,
                 ee_vel: Optional[np.ndarray] = None, jaw: float = 0.0,
+                joint_pos: Optional[np.ndarray] = None,
+                grasp_active: bool = False,
+                grasp_node_ids: Optional[Sequence[int]] = None,
                 contact_mode: Optional[int] = None,
                 contact_force: Optional[np.ndarray] = None) -> dict:
         """Record one step. Returns the metrics, computed over every particle."""
@@ -438,7 +459,13 @@ class MPMRecorder:
             ee_vel=ee_vel,
             action=action,
             jaw=jaw,
+            joint_pos=joint_pos,
+            grasp_active=grasp_active,
+            grasp_node_ids=grasp_node_ids,
             contact_mode=contact_mode,
+            # RULE: this solver has no force channel (sticky-velocity BC
+            # only) -- contact_force is always the writer's zero default here,
+            # a legitimate reading ("not measured"), not a value we computed.
             contact_force=contact_force,
             exposure=exposure,
             safety_strain=safety,
@@ -526,6 +553,172 @@ def record_episode(path: str, *, n_steps: int = 100, seed: int = 0,
     return out
 
 
+# -- robot-driven episodes ---------------------------------------------------
+
+# Jaw half-extents measured via host/psm.py's proxy construction are ~6-9mm,
+# well under one grid cell (dx=15.6mm). The vendored solver's default
+# threshold=0.05 (5cm) would extend the contact "halo" roughly 2 grid cells
+# beyond the jaw's true surface. This is the deliberately tighter, documented
+# choice instead -- roughly (largest jaw half-extent + one grid cell) rounded
+# down, since a tighter halo is the safe direction to be wrong in for a
+# sticky-contact collider (see host/smoke_test_psm.py's premature-perturbation
+# check). CONTACT_TOUCH_RADIUS_M is diagnostic-only for contact_mode
+# labelling below; it has no effect on the physics.
+GRASP_CONTACT_THRESHOLD_M = 0.02
+CONTACT_STICK_RADIUS_M = GRASP_CONTACT_THRESHOLD_M
+CONTACT_TOUCH_RADIUS_M = 2 * GRASP_CONTACT_THRESHOLD_M
+
+JAW_OPEN_RAD = 1.0
+JAW_CLOSED_RAD = 0.0
+
+
+def _scripted_waypoints(n_approach: int, n_close: int, n_retract: int):
+    """approach -> close -> retract. No planner -- a single hardcoded
+    demonstration path. Fixed orientation throughout, picked by reading a
+    real FK point rather than deriving one: at
+    base=psm.DEFAULT_BASE_POSITION/ORIENTATION, j1=0, sweeping
+    outer_insertion from 0 to 0.14 moves tool_gripper_center from a hover
+    point ~0.14 m above the tissue to just above its top surface without
+    changing orientation (verified directly against the live URDF before
+    this was written).
+
+    Returns (poses, jaws): poses is ((n_approach+n_close+n_retract+1), 7)
+    float64, jaws is (same length,) float64. poses[t]/jaws[t] is the state
+    BEFORE step t's action is applied -- poses[0] is the starting state.
+    """
+    quat = np.array([0.7048, -0.7048, -0.0576, 0.0576])
+    hover = np.array([0.274, 0.35, 0.226])
+    grasp = np.array([0.252, 0.35, 0.088])
+
+    poses = [np.concatenate([hover, quat])]
+    jaws = [JAW_OPEN_RAD]
+    for i in range(1, n_approach + 1):
+        t = i / n_approach
+        poses.append(np.concatenate([hover * (1 - t) + grasp * t, quat]))
+        jaws.append(JAW_OPEN_RAD)
+    for i in range(1, n_close + 1):
+        t = i / n_close
+        poses.append(np.concatenate([grasp, quat]))
+        jaws.append(JAW_OPEN_RAD * (1 - t) + JAW_CLOSED_RAD * t)
+    for i in range(1, n_retract + 1):
+        t = i / n_retract
+        poses.append(np.concatenate([grasp * (1 - t) + hover * t, quat]))
+        jaws.append(JAW_CLOSED_RAD)
+    return np.array(poses, np.float64), np.array(jaws, np.float64)
+
+
+def _contact_mode(rec: "MPMRecorder", robot: "psm.PSM") -> int:
+    """NONE/TOUCH/STICK only -- NEVER GRASP. Boundary()'s collision branch
+    (third_party/MPM/mpm3d.py:241-249) is an unconditional zero-slip velocity
+    constraint with no persistence -- the friction/slip code is commented out
+    ("sticky trick") and a particle leaving the SDF radius is released
+    immediately, no bookkeeping holds it. That is mechanically
+    trajectory_io.CONTACT_STICK, never CONTACT_GRASP ("jaws closed, tissue
+    kinematically attached"), which nothing in this solver implements. See
+    DECISION_LOG.md for the full argument and the spec for what
+    CONTACT_GRASP/grasp_active/grasp_node_ids will need once real persistent
+    attachment lands.
+
+    Distance is to each jaw box's SURFACE (accounting for half-extents), not
+    its center -- jaw half-extents (6-9mm) are not negligible next to the
+    ~20mm contact radius."""
+    pos_full, _, _ = rec.state()
+    pos = pos_full[rec.particle_ids].astype(np.float64)   # the recorded subset
+    poses = robot.jaw_box_poses()
+    d_min = np.inf
+    for link_name in psm.JAW_LINKS:
+        box_pos, box_quat = poses[link_name]
+        half_extents = robot.jaw_half_extents(link_name)
+        local = (pos - box_pos) @ psm.rotmat_from_quat(box_quat)
+        d = np.linalg.norm(np.maximum(np.abs(local) - half_extents, 0.0), axis=-1)
+        d_min = min(d_min, float(d.min()))
+    if d_min < CONTACT_STICK_RADIUS_M:
+        return trajectory_io.CONTACT_STICK
+    if d_min < CONTACT_TOUCH_RADIUS_M:
+        return trajectory_io.CONTACT_TOUCH
+    return trajectory_io.CONTACT_NONE
+
+
+def record_grasp_episode(path: str, *, n_steps: int = 50, seed: int = 0,
+                          n_record: int = DEFAULT_N_RECORD, quiet: bool = False,
+                          n_approach: int = 20, n_close: int = 10,
+                          n_retract: int = 20) -> str:
+    """A scripted approach -> close -> retract episode, driven by the dVRK Si
+    PSM (host/psm.py). Never emits CONTACT_GRASP; grasp_active is always
+    False and grasp_node_ids always empty -- see _contact_mode()'s docstring.
+
+    STATE/ACTION TIMING CONTRACT. Row t's ee_pose/jaw are the
+    commanded/analytic scripted waypoint values, NOT the IK-achieved pose --
+    this is what makes "applying row t's action reproduces row t+1's
+    recorded state" exact rather than approximate (checked in
+    host/smoke_test_psm.py), and avoids conflating two different "the pose"
+    values the way this adapter's own history warns against (two numbers
+    that agree with everything except each other -- see DECISION_LOG.md's
+    account of the timebase bug this project already hit once). IK-achieved
+    accuracy is validated separately, inside psm.PSM.set_ee_pose() itself,
+    which raises if achieved pose drifts from commanded beyond tolerance.
+    joint_pos is the ACHIEVED joint state (a genuinely different, useful
+    quantity: how far IK residual pushed the real configuration).
+
+    Collision geometry uses the END-of-frame transform: the PSM is driven to
+    the frame's target pose BEFORE advance() is called, so
+    advance()'s once-per-frame update_collision_geometry() reads that just-set
+    new pose and holds it constant across the frame's substeps; collision
+    velocity is the backward difference bracketing that same frame.
+    """
+    mu, lam, rho = sample_episode_material(seed)
+    poses, jaws = _scripted_waypoints(n_approach, n_close, n_retract)
+    n_total = n_approach + n_close + n_retract
+    if n_steps != n_total:
+        raise ValueError(
+            f"n_steps={n_steps} must equal n_approach+n_close+n_retract="
+            f"{n_total}")
+
+    t0 = time.time()
+    with MPMRecorder(path, task="tissue_grasp", mu=mu, lam=lam, rho=rho,
+                      n_record=n_record, seed=seed) as rec:
+        robot = psm.PSM(rec.m, rec.m.sdf,
+                         base_position=psm.DEFAULT_BASE_POSITION,
+                         base_orientation=psm.DEFAULT_BASE_ORIENTATION)
+        rec.robot = robot
+        try:
+            robot.set_ee_pose(poses[0], jaws[0])               # primes the
+            # per-proxy prev-pose cache (update_collision_velocity()'s
+            # first-frame convention) and validates the starting pose is
+            # reachable before anything is recorded.
+            robot.update_collision_geometry(rec.m, rec.m.sdf)  # so row 0's
+            # _contact_mode() reads real jaw geometry, not the stale
+            # far-away state proxies start at construction.
+
+            for t in range(n_steps):
+                action_t = actions.encode_action(poses[t], poses[t + 1], jaws[t + 1])
+                rec.capture(
+                    ee_pose=poses[t].astype(np.float32),
+                    action=action_t.astype(np.float32),
+                    jaw=float(jaws[t]),
+                    joint_pos=robot.joint_positions(),
+                    contact_mode=_contact_mode(rec, robot),
+                    grasp_active=False,
+                    grasp_node_ids=[],
+                )
+                robot.set_ee_pose(poses[t + 1], jaws[t + 1])
+                rec.advance(1, threshold=GRASP_CONTACT_THRESHOLD_M)
+        finally:
+            robot.close()
+        out = rec.close()
+        n_rec, n_sim = rec.n_record, rec.n_sim
+    wall = time.time() - t0
+
+    if not quiet:
+        E, nu = materials.E_nu_from_lame(mu, lam)
+        size = os.path.getsize(out) / 1e6
+        print(f"{os.path.basename(out)}: {n_steps} steps (grasp), "
+              f"{n_rec}/{n_sim} particles, {size:.1f} MB, {wall:.1f}s")
+        print(f"    material mu={mu:.0f} Pa lambda={lam:.0f} Pa "
+              f"(E={float(E):.0f} Pa, nu={float(nu):.4f}), rho={rho:.0f}")
+    return out
+
+
 def _episode_path(out_dir: str, index: int) -> str:
     return os.path.join(out_dir, f"mpm_{index:04d}.npz")
 
@@ -562,7 +755,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--out", default="data_mpm", help="output directory")
     ap.add_argument("--episodes", type=int, default=1)
-    ap.add_argument("--steps", type=int, default=100, help="recorded steps/episode")
+    ap.add_argument("--task", choices=("settle", "grasp"), default="settle",
+                    help="'settle': passive gravity settling, no robot "
+                         "(default, unchanged behavior). 'grasp': scripted "
+                         "approach/close/retract via host/psm.py's PSM.")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="recorded steps/episode (default: 100 for --task "
+                         "settle, 50 -- n_approach+n_close+n_retract's own "
+                         "default -- for --task grasp)")
     ap.add_argument("--n-record", type=int, default=DEFAULT_N_RECORD,
                     help="particles to record (solver simulates 24000)")
     ap.add_argument("--seed", type=int, default=0)
@@ -573,22 +773,24 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
+    record = record_episode if args.task == "settle" else record_grasp_episode
+    steps = args.steps if args.steps is not None else (100 if args.task == "settle" else 50)
 
     # THE CHILD BRANCH. `--index` present means "you are the one episode".
     # Dispatch never happens here, so recursion is structurally impossible
     # rather than merely unlikely -- the parent always passes --index, and a
     # process holding --index never spawns.
     if args.index is not None:
-        record_episode(_episode_path(args.out, args.index),
-                       n_steps=args.steps, seed=args.seed + args.index,
-                       n_record=args.n_record)
+        record(_episode_path(args.out, args.index),
+               n_steps=steps, seed=args.seed + args.index,
+               n_record=args.n_record)
         return 0
 
     # A single episode needs no isolation: there is nothing to collide with,
     # and a subprocess would add an interpreter start-up for nothing.
     if args.episodes == 1:
-        record_episode(_episode_path(args.out, 0), n_steps=args.steps,
-                       seed=args.seed, n_record=args.n_record)
+        record(_episode_path(args.out, 0), n_steps=steps,
+               seed=args.seed, n_record=args.n_record)
         print(f"\nwrote 1 episode to {args.out}/")
         print(f"validate with: python host/validate_dataset.py --data {args.out}/")
         return 0
@@ -600,7 +802,8 @@ def main(argv=None) -> int:
     for i in range(args.episodes):
         cmd = [sys.executable, os.path.abspath(__file__),
                "--out", args.out,
-               "--steps", str(args.steps),
+               "--task", args.task,
+               "--steps", str(steps),
                "--n-record", str(args.n_record),
                "--seed", str(args.seed),
                "--index", str(i)]

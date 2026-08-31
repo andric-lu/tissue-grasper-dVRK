@@ -15,6 +15,9 @@ data_synth/*.npz
 # 100-step episodes is ~1.7 GB. Ignoring the whole directory, not just *.npz,
 # because nothing in it is authored by hand.
 data_mpm/
+# --task grasp output (host/mpm_adapter.py, host/psm.py) -- same reasoning,
+# regenerable from the same command + seed.
+data_mpm_grasp/
 models/*.pt
 runs/
 *.mp4
