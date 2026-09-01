@@ -1990,6 +1990,30 @@ never appears.
   episodes collected here are a pipeline demonstration, not a claim about
   real tissue response to grasping.
 
+### 10.6 `host/visualize_grasp.py` — the recorded episode replayed with real mesh geometry
+
+`visualize_trajectory.py` renders `ee_pose` as a single square marker because
+it predates the PSM. That's honest but not the geometry a reader needs to
+judge whether the tool is actually where it looks like it should be relative
+to the tissue. `visualize_grasp.py` instead loads the wrist+jaw assembly's
+STL meshes (`tool_main_link` through the two jaw links — `link_0`–`link_4`,
+the arm base, are excluded: they sit ~0.5 m away at
+`psm.DEFAULT_BASE_POSITION` and would force the view to zoom out until the
+tissue is a speck), bakes each link's `<visual><origin>` transform into its
+vertices once (parsed from the URDF XML directly, not transcribed by hand),
+and replays `joint_pos` frame-by-frame through a throwaway PyBullet `DIRECT`
+connection to get live FK — no `host/psm.py`'s `PSM` class, no
+`MPM.mpm3d` import, no ~10 s Taichi compile, since pure rendering needs
+none of it.
+
+Checked directly, not assumed: at `jaw_joint_1 = 1.0` rad the two jaw
+meshes visibly splay open on either side of the yaw link; at `0.0` rad they
+close together into a single compact shape — the `jaw_joint_2 =
+-jaw_joint_1` mimic (host/psm.py) rendering correctly through independently
+loaded meshes, not just matching in the recorded numbers. A static frame
+mid-approach shows the instrument tip sitting directly at the tissue's top
+surface, matching `contact_mode`'s own timing.
+
 ---
 ## 11. Files
 
@@ -2037,6 +2061,7 @@ copy is the shareable view, not the only copy.
 | `psm_Si_model/` | — | dVRK Si PSM URDF + meshes; source/license still TODO | §10.1, §10.3 |
 | `host/psm.py` | macOS | PSM: IK, jaw proxy colliders, SDF/co_v/co_w sync | §10 |
 | `host/smoke_test_psm.py` | macOS | PSM smoke test, 19 checks | §10.4, **19/19** |
+| `host/visualize_grasp.py` | macOS | Renders --task grasp episodes with real PSM mesh geometry (wrist+jaw assembly), not a point marker | §10.6 |
 | `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run**; its dissipation verdict is superseded by §9.7 |
 | `src/energy_ledger.py` | **both** | Closed mechanical-energy budget, exponent fit, verdict | §9.7 |
 | `host/mpm_energy.py` | macOS | Instrumented MPM driver: split kernels, grid probes, known ICs | §9.7 |
