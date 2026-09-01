@@ -38,12 +38,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import xml.etree.ElementTree as ET
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pybullet as p
-import trimesh
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -69,41 +67,12 @@ TOOL_COLOR = "#b0883a"
 def _load_link_meshes(urdf_path: str, link_names) -> dict:
     """{link_name: (verts_in_link_frame (V,3) float64, faces (F,3) int64)}.
 
-    The <visual><origin> transform is baked into verts here, once -- only
-    the link's own FK transform needs to be applied per frame afterward.
-    """
-    tree = ET.parse(urdf_path)
-    urdf_dir = os.path.dirname(urdf_path)
-    out = {}
-    for link_el in tree.getroot().findall("link"):
-        name = link_el.get("name")
-        if name not in link_names:
-            continue
-        visual = link_el.find("visual")
-        if visual is None:
-            raise ValueError(f"link '{name}' has no <visual> element")
-        mesh_el = visual.find("geometry/mesh")
-        if mesh_el is None:
-            raise ValueError(f"link '{name}' visual has no <mesh> geometry")
-        mesh_path = os.path.join(urdf_dir, mesh_el.get("filename"))
-
-        origin_el = visual.find("origin")
-        rpy = [float(x) for x in origin_el.get("rpy", "0 0 0").split()] \
-            if origin_el is not None else [0.0, 0.0, 0.0]
-        xyz = [float(x) for x in origin_el.get("xyz", "0 0 0").split()] \
-            if origin_el is not None else [0.0, 0.0, 0.0]
-        # PyBullet's own rpy->quaternion is what interprets <origin rpy=...>
-        # when it loads the file -- reused here rather than a hand-rolled
-        # formula so this can only ever disagree with what PyBullet itself
-        # does with the same string, not with the URDF spec independently.
-        quat = np.array(p.getQuaternionFromEuler(rpy))
-        R = psm.rotmat_from_quat(quat)
-
-        mesh = trimesh.load(mesh_path, force="mesh")
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        verts_link = (R @ verts.T).T + np.array(xyz)
-        out[name] = (verts_link, np.asarray(mesh.faces, dtype=np.int64))
-
+    Thin wrapper over psm.mesh_vertices_in_link_frame() (element="visual" --
+    this is presentation-only, unlike host/psm.py's own use of that helper
+    for the physically-consequential jaw collision proxies, which reads
+    <collision> instead)."""
+    out = {name: psm.mesh_vertices_in_link_frame(urdf_path, name, element="visual")
+           for name in link_names}
     missing = set(link_names) - out.keys()
     if missing:
         raise ValueError(f"URDF is missing link(s): {sorted(missing)}")

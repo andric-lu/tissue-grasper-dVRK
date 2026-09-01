@@ -1976,10 +1976,7 @@ never appears.
   (a visual-only sphere) but nothing constrains the tool through it; IK is
   free-space 6-DOF. A real trocar constraint needs either a nullspace/
   secondary-objective IK term or a reduced action parameterization.
-- **Persistent grasp attachment.** The precise spec for `grasp_node_ids`
-  indexing (recorded-subset indices via `np.searchsorted(particle_ids, ...)`,
-  never full-solver indices) is written down in `host/mpm_adapter.py`'s
-  `_contact_mode()` docstring for whenever this lands; not implemented here.
+- ~~Persistent grasp attachment.~~ **Done, §10.7** — `host/grasp_constraint.py`.
 - **`psm_Si_model/PROVENANCE.md`'s source/license fields are still TODO.**
   Blocks nothing technically, but should be resolved before this asset is
   treated as a permanent part of the repository's history.
@@ -2014,12 +2011,161 @@ loaded meshes, not just matching in the recorded numbers. A static frame
 mid-approach shows the instrument tip sitting directly at the tissue's top
 surface, matching `contact_mode`'s own timing.
 
+### 10.7 Four real bugs, and a real persistent grasp (`host/grasp_constraint.py`)
+
+§10's PSM was reviewed again — by name, four specific bugs, plus a request to
+implement the persistent grasp attachment §10.5 had left as future work. All
+four bugs were confirmed by reading the code directly before any fix; all
+four were real.
+
+**1. Jaw collision boxes used a world-frame AABB as if it were local-frame.**
+`_build_jaw_proxy()` computed `half_extents` from `p.getAABB()` — world-axis-
+aligned — and reused those three numbers directly as the box's LOCAL
+half-extents (the box's own axes are identity relative to the jaw). Since the
+jaw's local frame is not world-axis-aligned at the reference pose, this
+scrambled which measured extent belonged to which local axis. Measured true
+local half-extents: `[2.50, 5.75, 1.58]` mm; the world-AABB-derived values
+were `[5.94, 5.50, 9.38]` mm — oversized on two axes, short on the third.
+Fixed by adding `psm.mesh_vertices_in_link_frame()` (moved out of
+`host/visualize_grasp.py`'s `_load_link_meshes()`, which already did this
+exact transform for rendering — now the single, shared, correctness-critical
+source, reading `<collision>` origin, not `<visual>`) and taking a plain
+axis-aligned min/max of vertices already expressed in the link's own local
+frame. The fixed value reproduces the independently-measured
+`[2.50, 5.75, 1.58]` mm exactly; `host/smoke_test_psm.py` now asserts this as
+a named regression value, not just "some number now."
+
+**2. Collision velocity was never actually primed.** A comment on
+`set_ee_pose(poses[0], jaws[0])` claimed it "primes the per-proxy prev-pose
+cache" — false. `set_ee_pose()` never touches `PSM._prev_box_pose`; only
+`update_collision_velocity()` does, and it was never called before the loop.
+So the very first REAL commanded transition took the "first frame, zero
+velocity, no sweep-limit check" branch instead of a true priming call — the
+actual first move was recorded with zero jaw velocity and skipped its safety
+check entirely. Fixed: `robot.update_collision_velocity(rec.m, rec.frame_dt)`
+now runs once, explicitly, right after the initial `update_collision_geometry()`
+call, before the loop — "before the episode starts" is now the real priming
+moment.
+
+**3. The episode's actual final state was simulated but never recorded.** 51
+waypoints, but the loop only ever captured 50 rows — the last action's
+resulting state (`poses[50]`) was executed but discarded. Fixed: one more
+`capture()` call after the loop, with a zero-padded action, matching
+`src/actions.py`'s own documented final-row convention. Episodes are now
+`T = n_steps + 1` rows.
+
+**4. Contact detection used the recorded subset instead of all particles.**
+`_contact_mode()` subsetted to `rec.particle_ids` (3000 of 24000) *before*
+computing the minimum box-surface distance — biasing that minimum upward
+(never too small), against the project's own established rule (used
+everywhere else for `safety_strain`/`exposure`): compute extrema over the
+full particle set, subset only for what's written to disk. Fixed to use
+`pos_full` directly.
+
+**The new feature: `host/grasp_constraint.py`.** A host-owned, persistent
+rigid attachment: on freeze, select full-solver particles within
+`GRASP_CAPTURE_RADIUS_M` of *both* jaw box surfaces simultaneously (requiring
+both is what turns "near a jaw" into "in the gap between them," and makes
+freeze self-gating on jaw angle with no extra threshold — the two boxes are
+geometrically far apart while open, so nothing can satisfy both proximities
+regardless of radius); freeze membership and each particle's position in the
+gripper's frame (`r_p`, captured relative to the **commanded** pose, not the
+IK-achieved one — same reasoning as the state/action timing contract
+elsewhere in this file); enforce `x_p(t) = T_gripper(t) . r_p`,
+`v_p = v_gripper + omega_gripper x (x_p - c)` **every substep** (not once per
+frame — `MPMRecorder.advance()` gained a `grasp`/`pose_start`/`pose_end`
+parameter set, threaded explicitly through every call rather than cached
+internally, specifically to avoid a third instance of the "looks primed but
+isn't" bug class bugs 2 and the original collision-frame review both hit).
+`CONTACT_GRASP` is emitted only while the mask is nonempty; release is a
+separate, explicit jaw-angle trigger (`JAW_RELEASE_TRIGGER_RAD = 0.3` rad —
+release cannot legitimately be geometric drift, since a forced particle
+ending up outside its own now-irrelevant proximity radius must not
+auto-release). A 4th scripted phase (`n_release`) was added so release is
+actually exercised at least once — the original 3-phase script never reopens
+the jaw.
+
+`substep()` (`third_party/MPM/mpm3d.py:309-320`) is one Taichi kernel —
+clear grid, P2G, Boundary, G2P, all inlined — with no interception point
+from Python between them. Enforcement is therefore a **post-substep
+correction**: let the vendored kernel run normally, then overwrite `F_x`/`F_v`
+for attached indices via a small new kernel, closing over the real field
+objects the same way `host/mpm_energy.py`'s `_build_kernels()` already does
+in this codebase — including that file's own documented workaround for
+`from __future__ import annotations` breaking Taichi's kernel-argument type
+resolution (no annotated arguments; the gripper transform lives in small
+persistent 0-d fields instead, updated via plain Python assignment, the same
+idiom `mpm3d.py` uses for `co_v`/`co_w`/`centroid`).
+
+**`F_C[p]` is zeroed for attached particles, and this reverses the first
+design's stated judgment call — because the first design's reasoning was
+empirically wrong.** The original plan explicitly argued for leaving `F_C[p]`
+untouched (zeroing it would falsely claim zero local strain). Built and run:
+with `F_C[p]` left alone, a real 60-row episode showed logged `safety_strain`
+spike to **26.6x and 15.9x** at several frames — physically absurd, and
+`validate_dataset.py` correctly FAILed on it. Diagnosis: every substep, `G2P()`
+resamples `F_C[p]` from the grid velocity *gradient* at the particle's
+*current* position — but that position was just teleported to the rigid
+target by this file's own correction, into a grid neighbourhood the
+particle's momentum was never part of. The resulting sampled gradient is a
+numerical artifact of the teleport, not a real strain-rate, and
+`P2G()`'s `F[p] = (I + dt*F_C[p]) @ F[p]` compounds it every subsequent
+substep. Zeroing `F_C[p]` for attached particles breaks the loop entirely:
+the same episode's peak `safety_strain` dropped to a physically reasonable
+2.25x. `F[p]` itself is never written directly and is not indirectly frozen
+either — this measured correction, not the first draft's a priori reasoning,
+is what shipped.
+
+**`check_grasp_is_consistent` needed a real fix, not a weakening.**
+`grasp_node_ids` indexes the recorded N-particle subset (3000 of 24000);
+a real, small, frozen attachment (measured: often just 1-3 full-solver
+particles) can legitimately never intersect that subset at all, which used
+to read as `grasp_active=True` with empty ids — the exact pattern the
+existing check FAILed on. But since `host/grasp_constraint.py` freezes
+membership once and never recomputes it while active, `grasp_node_ids` must
+be **identical** across every step of one continuous active run — which can
+legitimately mean "always empty," but can never legitimately flicker. The
+check now enforces exactly that (a strictly stronger invariant than before,
+catching a failure mode — mid-grasp membership changing — the old check
+couldn't see at all) and downgrades the empty-subset case to an explanatory
+WARN rather than a FAIL.
+
+**Verification.**
+```
+pytest tests/ -q                                        278 passed, 1 skipped
+python host/smoke_test_psm.py                            17 passed, 0 failed
+python host/smoke_test_grasp.py                           8 passed, 0 failed
+python host/mpm_adapter.py --task grasp --out data_mpm_grasp \
+    --episodes 2 --n-release 10
+python host/validate_dataset.py --data data_mpm_grasp/
+```
+Both real episodes show `contact_mode` staging cleanly through
+`none -> touch -> stick -> grasp -> ... -> none`, `check_boundary_is_held`
+and `check_contact_mode_transitions` both PASS, and `CONTACT_GRASP` is
+genuinely present — not fabricated, not proximity-only.
+
+**Still open, honestly.** `check_logged_metrics_match_recomputation`'s
+`safety_strain` corroboration can legitimately FAIL for a grasp episode: its
+margin was calibrated against passive settling, where peak stretch is
+diffuse, but a grasp concentrates peak stretch at the 1-3-particle grasp
+point, which a random 3000/24000 subset can easily miss regardless of how
+correct the physics is. Verified directly (not assumed): the FULL-particle
+logged value itself is a modest, physically reasonable ~2.1x in the case
+this was checked against — no blowup — so this is a subset-coverage gap in a
+pre-existing, unmodified check, not a sign the grasp constraint is wrong.
+Not fixed here — it touches a check that also protects passive-episode data
+integrity, and the right fix (task-aware margin? bias `n_record` sampling
+toward the grasp region? something else?) is a real design decision, not a
+bug fix, left for whoever collects `--task grasp` data at scale next.
+
 ---
 ## 11. Files
 
 Every path below was checked against the repository on 17 August 2026; the
 four §9.7 rows were added on 26 August 2026; the `psm_Si_model`/`psm.py`/
-`smoke_test_psm.py` rows were added on 31 August 2026 (§10).
+`smoke_test_psm.py` rows were added on 31 August 2026 (§10); the
+`grasp_constraint.py`/`smoke_test_grasp.py` rows and the `psm.py`/
+`mpm_adapter.py`/`validate_dataset.py` updates were added the same day (§10.7).
 
 **Correction.** Earlier versions of this table listed files that had been written
 during a session but never saved to disk. `container/validate_physics.py` was one
@@ -2053,14 +2199,16 @@ copy is the shareable view, not the only copy.
 | `host/verify_host.py` | macOS | GPU reachability checks | |
 | `host/train_dynamics.py` | macOS | MLP baseline on MPS | |
 | `host/visualize_trajectory.py` | macOS | 3D animation + stability diagnostics | |
-| `host/validate_dataset.py` | macOS | 16 data-integrity checks | §8.5, §9.2, §9.5 |
+| `host/validate_dataset.py` | macOS | 17 data-integrity checks | §8.5, §9.2, §9.5, §10.7 |
 | `host/smoke_test_mpm.py` | macOS | MPM smoke test, 16 checks | §9.4, §9.5, **16/16** |
 | `third_party/PROVENANCE.md` | — | Upstream SHA, checksums, local edits | §9.4 |
 | `third_party/MPM/` | macOS | Vendored SurRoL `Dev` MPM, 4 files, unmodified | §9.3, §9.4 |
-| `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5, §10 |
+| `host/mpm_adapter.py` | macOS | MPM -> v2.1 episodes, one child process each | §9.5, §10, §10.7 |
 | `psm_Si_model/` | — | dVRK Si PSM URDF + meshes; source/license still TODO | §10.1, §10.3 |
-| `host/psm.py` | macOS | PSM: IK, jaw proxy colliders, SDF/co_v/co_w sync | §10 |
-| `host/smoke_test_psm.py` | macOS | PSM smoke test, 19 checks | §10.4, **19/19** |
+| `host/psm.py` | macOS | PSM: IK, jaw proxy colliders (local-frame AABB, §10.7), SDF/co_v/co_w sync, shared mesh-in-link-frame helper | §10, §10.7 |
+| `host/grasp_constraint.py` | macOS | Persistent grasp: freeze/release, per-substep F_x/F_v correction kernel | §10.7 |
+| `host/smoke_test_psm.py` | macOS | PSM smoke test, 17 checks | §10.4, §10.7, **17/17** |
+| `host/smoke_test_grasp.py` | macOS | GraspConstraint smoke test, 8 checks | §10.7, **8/8** |
 | `host/visualize_grasp.py` | macOS | Renders --task grasp episodes with real PSM mesh geometry (wrist+jaw assembly), not a point marker | §10.6 |
 | `host/substep_study.py` | macOS | Substep convergence sweep, one child per row | §9.6, **run**; its dissipation verdict is superseded by §9.7 |
 | `src/energy_ledger.py` | **both** | Closed mechanical-energy budget, exponent fit, verdict | §9.7 |
