@@ -218,16 +218,48 @@ def check_tissue_actually_moved(tr) -> Result:
 
 @check()
 def check_grasp_is_consistent(tr) -> Result:
-    """grasp_active agrees with the recorded grasp node ids."""
-    # WHY: the two are written from different variables in the collector, and
-    # one of them is cleared on release. They drift apart silently.
+    """grasp_active agrees with grasp_node_ids -- allowing for the recorded
+    subset to entirely miss a small, frozen attachment, but never for
+    membership to change while grasp_active stays True."""
+    # WHY: the two used to be written from different variables in the
+    # collector, so they could drift apart silently -- that failure mode is
+    # still checked below (ids without an active flag). But
+    # host/grasp_constraint.py freezes membership once, at freeze time, and
+    # never recomputes it while active, and grasp_node_ids is a REMAP of that
+    # frozen full-solver set into the recorded N-particle subset (never all
+    # 24,000 simulated particles) -- so an attachment small enough that none
+    # of it lands in the ~N/n_simulated-sampled subset legitimately produces
+    # EMPTY grasp_node_ids at every step of that grasp, and that alone is not
+    # a bug: it is invisible in the recorded data, not absent from the
+    # physics. What the check demands instead: whatever grasp_node_ids reads
+    # (empty or not) must be IDENTICAL across every step of one continuous
+    # active run, because membership cannot legitimately change mid-grasp.
     grasp = tr.grasp_active.astype(bool)
     if not grasp.any():
         return Result(WARN, "grasp never active in this episode")
-    empty = [t for t in np.flatnonzero(grasp) if tr.grasp_ids(int(t)).size == 0]
-    if empty:
-        return Result(FAIL, f"grasp_active True but no node ids at {len(empty)} step(s), "
-                            f"first at {empty[0]}")
+    ids_per_step = [tr.grasp_ids(int(t)) for t in range(len(tr))]
+
+    ghost = [t for t in range(len(tr)) if not grasp[t] and ids_per_step[t].size]
+    if ghost:
+        return Result(FAIL, f"grasp_node_ids nonempty while grasp_active is False "
+                            f"at step {ghost[0]} -- ids without an active flag")
+
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], grasp.astype(int), [0]])))
+    for a, b in zip(edges[::2], edges[1::2]):
+        run_ids = {tuple(sorted(ids_per_step[t].tolist())) for t in range(a, b)}
+        if len(run_ids) > 1:
+            return Result(FAIL, f"grasp_node_ids changes within one continuous "
+                                f"active run [{a},{b}) -- membership should be "
+                                "frozen while grasp_active stays True")
+
+    n_empty_active = sum(1 for t in range(len(tr)) if grasp[t] and ids_per_step[t].size == 0)
+    if n_empty_active:
+        return Result(WARN, f"grasp active for {int(grasp.sum())}/{len(tr)} step(s), "
+                            f"but the recorded {tr.n_nodes}/"
+                            f"{int(tr.n_particles_simulated)}-particle subset never "
+                            "includes an attached particle -- expected when the "
+                            "attachment is small relative to the sampling fraction, "
+                            "not necessarily a bug")
     return Result(PASS, f"grasped {tr.grasp_ids(int(np.argmax(grasp))).size} node(s) "
                         f"for {int(grasp.sum())}/{len(tr)} steps")
 
@@ -473,6 +505,27 @@ def check_particle_subset_is_coherent(tr) -> Result:
         return Result(PASS, f"all {tr.n_nodes} simulated particles recorded")
     return Result(PASS, f"{tr.n_nodes} of {n_sim} particles recorded "
                         f"({tr.subset_fraction:.1%}), ids unique and in range")
+
+
+@check()
+def check_grasp_ids_in_range(tr) -> Result:
+    """Every grasp_node_ids entry indexes the recorded subset, not full-solver particles."""
+    # WHY: grasp_node_ids is defined to index the recorded N-particle subset
+    # (0..N-1), never the full-solver particle array (0..n_particles_simulated)
+    # -- a downstream visualizer indexes tissue_pos[grasp_node_ids] directly,
+    # and tissue_pos is already subsetted. A full-solver index leaking through
+    # unmapped would silently alias to the wrong recorded node whenever it
+    # happens to be < N, and IndexError whenever it isn't -- no error anywhere
+    # before this check existed. TrajectoryWriter.append() now rejects this at
+    # write time too; this is the read-time half of the same guarantee, for
+    # files written before that check existed or by something else entirely.
+    if tr.grasp_ids_flat.size == 0:
+        return Result(SKIP, "no grasp ids recorded")
+    bad = (tr.grasp_ids_flat < 0) | (tr.grasp_ids_flat >= tr.n_nodes)
+    if bad.any():
+        return Result(FAIL, f"{int(bad.sum())} grasp_node_ids outside "
+                            f"[0,{tr.n_nodes}), e.g. {int(tr.grasp_ids_flat[bad][0])}")
+    return Result(PASS, f"all {tr.grasp_ids_flat.size} grasp id(s) in [0,{tr.n_nodes})")
 
 
 @check()

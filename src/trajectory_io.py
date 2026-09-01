@@ -525,6 +525,19 @@ class TrajectoryWriter:
 
         ids = np.asarray(grasp_node_ids, np.int32).ravel() if grasp_node_ids is not None \
             else np.zeros(0, np.int32)
+        # grasp_node_ids indexes the RECORDED N-particle subset (0..N-1),
+        # never full-solver particle indices (0..n_particles_simulated) -- a
+        # downstream visualizer uses them directly against tissue_pos, which
+        # is already subsetted. A leaked full-solver index would silently
+        # alias to the wrong recorded node whenever it happens to be < N, and
+        # IndexError whenever it isn't -- catch it here, at the point the
+        # caller that produced it is still on the stack.
+        if ids.size and (np.any(ids < 0) or np.any(ids >= self._n_nodes)):
+            raise ValueError(
+                f"grasp_node_ids must satisfy 0 <= id < {self._n_nodes} (the "
+                f"recorded node count N), got range [{int(ids.min())},"
+                f"{int(ids.max())}] at step {len(self._pos) - 1} -- looks "
+                "like a full-solver particle index leaked through unmapped")
         self._grasp_ids_flat.append(ids)
         self._grasp_offset.append(self._grasp_offset[-1] + ids.size)
 
