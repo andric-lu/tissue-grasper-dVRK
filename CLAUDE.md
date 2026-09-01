@@ -136,9 +136,12 @@ chronological one. Both are in the repo and must stay there.
   files as §9.5's evidence: they predate both the P-wave substep and the density
   fix, so they ran at ρ = 1000 whatever they record. Evidence, never a baseline.
 - **`data_mpm_grasp/` is gitignored and regenerable** — `--task grasp`
-  episodes (§10), a real PSM approach/close/retract. Two episodes validate
-  clean (0 FAIL); `grasp is consistent` WARNs honestly on both, by design —
-  see "The PSM" below before treating that WARN as a bug.
+  episodes (§10, §10.7), a real PSM approach/close/retract/[release] with a
+  genuinely persistent grasp. `CONTACT_GRASP` now appears for real.
+  `grasp is consistent` and `safety_strain` corroboration can both
+  legitimately WARN/FAIL depending on whether the (typically 1-3-particle)
+  attachment lands in the recorded subset — see "The PSM" below before
+  treating either as a bug.
 - **The MLP is a placeholder.** MeshGraphNets is the target; the schema already
   carries `tissue_faces` / `tissue_tets`.
 
@@ -265,7 +268,8 @@ episode" holds only because every episode is a fresh process.
 kinematically through `host/psm.py`'s `PSM` class and wired into
 `host/mpm_adapter.py`'s `record_grasp_episode()` (`--task grasp`, `--task
 settle` stays the unchanged passive default). `host/smoke_test_psm.py`
-passes 19/19. What it established that you need to know:
+passes 17/17; `host/smoke_test_grasp.py` (new, §10.7) passes 8/8. What it
+established that you need to know:
 
 - **A `co_obj` slot with `link_id == -1` is corruption, not a no-op.**
   `sdf.py` takes the "needle" precomputed-SDF path for it, and nothing in
@@ -295,19 +299,44 @@ passes 19/19. What it established that you need to know:
   `switch_reference_frame_and_update_sdf` must be explicit `float32`;
   `numpy`'s default float64 fails at the first `.from_numpy()` call with no
   warning beforehand. Found by running it, not predicted.
-- **This solver has no persistent grasp.** `Boundary()`'s collision branch is
-  an unconditional, non-persistent zero-slip constraint — mechanically
-  `CONTACT_STICK`, never the schema's `CONTACT_GRASP` ("jaws closed, tissue
-  kinematically attached"). Every grasp episode emits only
-  `NONE`/`TOUCH`/`STICK`; `grasp_active` is always `False`,
-  `grasp_node_ids` always empty; `check_grasp_is_consistent` keeps WARNing,
-  honestly, until real attachment is built. **Do not label proximity as
-  `CONTACT_GRASP` to make that WARN go away** — a first design draft tried
-  exactly that and was rejected specifically for it.
-- **Jaw half-extents measured at ~6–9 mm**, smaller than one grid cell
-  (`dx=15.6 mm`). Collection uses `threshold=0.02`, not the vendored
-  default `0.05`, which would extend the contact halo roughly two grid
-  cells beyond the jaw's true surface.
+- **Persistent grasp is real now (`host/grasp_constraint.py`, §10.7).**
+  `Boundary()`'s own collision branch is still just an unconditional,
+  non-persistent zero-slip constraint (`CONTACT_STICK`, never `CONTACT_GRASP`
+  on its own) — but `GraspConstraint` freezes a particle set relative to the
+  gripper on closure and forces `x_p(t)=T_gripper(t).r_p` every substep,
+  independent of the SDF halo. `CONTACT_GRASP` is emitted only while that
+  mask is nonempty. **Still never label mere proximity as `CONTACT_GRASP`** —
+  that's exactly the shortcut a first draft was rejected for.
+- **`F_C[p]` must be zeroed for attached particles — measured, not assumed.**
+  A first cut left it untouched (reasoning: zeroing would falsely claim zero
+  local strain). That reasoning was wrong in practice: leaving it creates a
+  feedback loop (`G2P()` resamples a velocity *gradient* at the
+  teleported-to position every substep, `P2G()`'s `F[p]` update compounds
+  it) that spiked a real episode's `safety_strain` to 26.6x. Zeroing `F_C[p]`
+  for attached particles broke the loop; the same episode dropped to 2.25x.
+  If you ever touch `grasp_constraint.py`'s correction kernel, re-run
+  `host/smoke_test_grasp.py` and check `safety_strain` stays bounded, not
+  just that the code runs.
+- **Jaw half-extents are `[2.50, 5.75, 1.58]` mm — measured from the actual
+  local-frame mesh, not `p.getAABB()`.** An earlier version used
+  `p.getAABB()` (world-axis-aligned) and reused those numbers AS IF they
+  were local-frame half-extents — silently wrong on a non-axis-aligned link.
+  `psm.mesh_vertices_in_link_frame()` is the fix and the one correct source
+  for this now; `host/visualize_grasp.py` uses the same helper for
+  rendering. Collection uses `threshold=0.02`, not the vendored default
+  `0.05`, which would extend the contact halo roughly two grid cells beyond
+  the jaw's true (now-correct, smaller) surface.
+- **`grasp_node_ids` is often empty even while a grasp is genuinely active** —
+  a real, frozen attachment (typically 1-3 full-solver particles, measured)
+  can easily miss the 3000/24000 recorded subset entirely. This is expected,
+  not a bug; `check_grasp_is_consistent` now allows it (but still FAILs if
+  membership flickers within one continuous active run, which it structurally
+  cannot do if `GraspConstraint` is working correctly). A downstream
+  consequence: `check_logged_metrics_match_recomputation`'s `safety_strain`
+  subset-corroboration can legitimately FAIL for a grasp episode too — its
+  margin was calibrated against diffuse settling, and a grasp concentrates
+  peak stretch at that same tiny point. Not fixed; see DECISION_LOG.md §10.7
+  "Still open."
 - **Base placement is empirical** (`psm.DEFAULT_BASE_POSITION`/
   `ORIENTATION`), picked via `workspace_aabb()`, not derived — the chain has
   too many compounded rotated offsets to hand-derive reliably.

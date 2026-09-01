@@ -62,10 +62,12 @@ from __future__ import annotations
 
 import os
 import sys
+import xml.etree.ElementTree as ET
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pybullet as p
+import trimesh
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
@@ -129,6 +131,57 @@ def rotmat_from_quat(quat: np.ndarray) -> np.ndarray:
     return np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
 
 
+def mesh_vertices_in_link_frame(urdf_path: str, link_name: str,
+                                 element: str = "collision"
+                                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """(verts (V,3) float64, faces (F,3) int64) for one link's <visual> or
+    <collision> mesh, with that element's own <origin> transform baked in --
+    the vertices are in the LINK's own local frame (i.e. what a live FK
+    transform of the link should be composed with), not world frame and not
+    raw mesh-file-local coordinates.
+
+    Shared by two different needs: `_build_jaw_proxy()` uses
+    element="collision" to size the physically-consequential box proxy from
+    the real mesh, in the frame that actually matters for collision --
+    reading <collision> is the semantically correct source (this asset's
+    <visual> and <collision> origins happen to be byte-identical for the jaw
+    links, but that's a property of this asset, not something to rely on).
+    host/visualize_grasp.py uses element="visual" to render the tool -- a
+    different, presentation-only need that should keep using the display
+    geometry even if the two ever diverge.
+    """
+    tree = ET.parse(urdf_path)
+    urdf_dir = os.path.dirname(urdf_path)
+    link_el = next((el for el in tree.getroot().findall("link")
+                     if el.get("name") == link_name), None)
+    if link_el is None:
+        raise ValueError(f"URDF has no link named '{link_name}'")
+    geom_el = link_el.find(element)
+    if geom_el is None:
+        raise ValueError(f"link '{link_name}' has no <{element}> element")
+    mesh_el = geom_el.find("geometry/mesh")
+    if mesh_el is None:
+        raise ValueError(f"link '{link_name}' <{element}> has no <mesh> geometry")
+    mesh_path = os.path.join(urdf_dir, mesh_el.get("filename"))
+
+    origin_el = geom_el.find("origin")
+    rpy = [float(x) for x in origin_el.get("rpy", "0 0 0").split()] \
+        if origin_el is not None else [0.0, 0.0, 0.0]
+    xyz = [float(x) for x in origin_el.get("xyz", "0 0 0").split()] \
+        if origin_el is not None else [0.0, 0.0, 0.0]
+    # PyBullet's own rpy->quaternion is what interprets <origin rpy=...> when
+    # it loads the file -- reused here rather than a hand-rolled formula so
+    # this can only ever disagree with what PyBullet itself does with the
+    # same string, not with the URDF spec independently.
+    quat = np.array(p.getQuaternionFromEuler(rpy))
+    R = rotmat_from_quat(quat)
+
+    mesh = trimesh.load(mesh_path, force="mesh")
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    verts_link = (R @ verts.T).T + np.array(xyz)
+    return verts_link, np.asarray(mesh.faces, dtype=np.int64)
+
+
 class PSM:
     """One dVRK Si PSM, driven kinematically, colliding with the MPM tissue
     through two jaw-shaped box proxies.
@@ -154,6 +207,7 @@ class PSM:
                 "third_party/MPM/sdf.py's calls have no physicsClientId and "
                 "would silently target the wrong client. One PSM per process.")
 
+        self._urdf_path = urdf_path
         self.body = p.loadURDF(
             urdf_path, basePosition=list(base_position),
             baseOrientation=list(base_orientation), useFixedBase=True)
@@ -226,28 +280,29 @@ class PSM:
     # -- construction-time geometry ----------------------------------------
 
     def _build_jaw_proxy(self, link_name: str) -> dict:
-        """One-time: measure the jaw mesh's AABB at the URDF's default pose
-        (all driven joints at 0, per PyBullet's own default after loadURDF)
-        and build a zero-offset box proxy sized to it. See module docstring
-        point 2 for why the offset is tracked here rather than passed to
-        PyBullet's own collision-frame parameters."""
-        link_idx = self._link_index[link_name]
-        aabb_min, aabb_max = p.getAABB(self.body, link_idx)
-        jaw_pos, jaw_quat = p.getLinkState(
-            self.body, link_idx, computeForwardKinematics=1)[4:6]
-        aabb_min, aabb_max = np.array(aabb_min), np.array(aabb_max)
-        jaw_pos, jaw_quat = np.array(jaw_pos), np.array(jaw_quat)
+        """One-time: measure the jaw mesh's TRUE LOCAL-FRAME extent from its
+        <collision> mesh via mesh_vertices_in_link_frame(), and build a
+        zero-offset box proxy sized to it.
 
-        half_extents = (aabb_max - aabb_min) / 2.0
-        world_center = (aabb_max + aabb_min) / 2.0
-        # world -> jaw-local. The box's rotation relative to the jaw frame is
-        # taken as identity ("axis-aligned at its proxy link origin"); this
-        # is a possibly-loose box if the jaw's local axes aren't well aligned
-        # with its own mesh extent at this reference pose -- a safe direction
-        # to be wrong in for a sticky-contact collider, and checked
-        # quantitatively (against measured half-extents) in the smoke test
-        # rather than assumed tight here.
-        local_center = rotmat_from_quat(jaw_quat).T @ (world_center - jaw_pos)
+        CORRECTNESS NOTE (this used to be a real bug): an earlier version
+        measured the jaw's WORLD-axis-aligned bounding box via p.getAABB()
+        and reused those three numbers directly as the box's LOCAL
+        half-extents. Since the jaw's local frame is not world-axis-aligned
+        at any reachable pose, this silently scrambled which measured extent
+        belonged to which local axis -- measured true local half-extents are
+        ~[2.5, 5.75, 1.58] mm; the world-AABB-derived values were
+        ~[5.94, 5.50, 9.38] mm, oversized on two axes and short on the third.
+        mesh_vertices_in_link_frame() already returns vertices WITH the
+        <collision><origin> transform baked in -- i.e. already in the link's
+        own local frame -- so a plain axis-aligned min/max here is a true
+        local-frame AABB, not a world-frame one reinterpreted. See module
+        docstring point 2 for why the offset is tracked here rather than
+        passed to PyBullet's own collision-frame parameters."""
+        verts, _ = mesh_vertices_in_link_frame(self._urdf_path, link_name,
+                                               element="collision")
+        local_min, local_max = verts.min(axis=0), verts.max(axis=0)
+        half_extents = (local_max - local_min) / 2.0
+        local_center = (local_max + local_min) / 2.0
 
         box_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents.tolist())
         proxy_id = _create_proxy_body(box_shape)
