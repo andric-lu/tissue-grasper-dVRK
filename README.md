@@ -41,17 +41,22 @@ forcing a rewrite of the modelling code.
 
 | Path | Runs on | Contents |
 |---|---|---|
-| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema v2.0), `actions.py`, `materials.py`, `tissue_metrics.py`, `synthetic_traj.py` |
+| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema v2.0), `actions.py` (pose/action encoding, now built on `scipy.spatial.transform.Rotation`), `materials.py`, `tissue_metrics.py`, `synthetic_traj.py`, `checks.py` (shared PASS/WARN/SKIP/FAIL reporting), `diagnostics.py` (shared release-step / recoil-vs-divergence helpers) |
 | `host/` | macOS | `environment.yml`, `verify_host.py`, `train_dynamics.py`, `visualize_trajectory.py`, `validate_dataset.py` |
 | `container/` | Linux | `verify_container.py`, `make_tissue_mesh.py`, `collect_retraction.py`, `timestep_study.py`, `validate_physics.py` |
 | `tests/` | macOS | 200 unit tests over the `src/` layer |
-| `docker/` | — | `Dockerfile` |
+| `docker/` | — | `Dockerfile` (built via `docker-compose.yml` at the repo root) |
 | `data/`, `data_synth/`, `models/` | **both** | Trajectories and checkpoints (git-ignored) |
 
 **What lives in `src/`** — everything both sides of the split must agree on. The
 trajectory schema, the action encoding, the material parameterisation, and the
 two metrics the controller optimises. Defined once here so a collector and a
-trainer cannot quietly disagree about what a number means.
+trainer cannot quietly disagree about what a number means. `checks.py` and
+`diagnostics.py` are newer additions to that same idea: four scripts had each
+grown their own copy of "run a check, print PASS/WARN/SKIP/FAIL, tally the
+result" and two files had each grown their own copy of "which step did the
+grasp release on, and was the fastest motion near it" — both are now written
+once and imported everywhere they're used (`DECISION_LOG.md` §12).
 
 ---
 
@@ -109,17 +114,34 @@ connectivity and locking the model to a single mesh resolution. A graph network
 already carries `tissue_faces` / `tissue_tets` for that purpose.
 
 **Open and blocking: timestep convergence.** `container/timestep_study.py` has
-never been run, `DT` is still 1/1000, and every episode in `data/` was collected
-at that unvalidated timestep. `DECISION_LOG.md` §4.
+never been run, `DT` is still 1/1000 in `container/collect_retraction.py`, and
+every episode in `data/` was collected at that unvalidated timestep.
+`DECISION_LOG.md` §4.
 
 **Never run: `container/validate_physics.py`.** Nine controlled physics
-experiments, written 1 August, restored to the repository 17 August, still not
-executed once.
+experiments, written 1 August, restored to the repository 17 August. Its
+PASS/WARN/SKIP/FAIL reporting was folded into the shared `src/checks.py` on
+2 September, but the experiments themselves have still never been executed —
+see `DECISION_LOG.md` §10, §12.4.
 
 **The material ranges are placeholders.** `src/materials.py` ships
 order-of-magnitude stand-ins for generic soft tissue. Liver, bowel and fat differ
 from each other by more than the width of those ranges. No result should be
 claimed from a model trained on them.
+
+**2 September code-review pass — no physics changed.** A pass through the
+codebase asking "is anything hand-built here that a well-tested library already
+does, and is any logic copied across files instead of shared" produced three
+changes, each verified to reproduce the prior behaviour exactly rather than
+assumed to: the ~100 lines of hand-rolled quaternion math in `src/actions.py`
+were replaced with `scipy.spatial.transform.Rotation` (already a project
+dependency); the PASS/WARN/SKIP/FAIL check-reporting duplicated across
+`verify_host.py`, `verify_container.py`, `validate_physics.py` and
+`validate_dataset.py` was consolidated into `src/checks.py`; and the
+release-step/peak-speed/recoil-vs-divergence logic duplicated between
+`visualize_trajectory.py` and `timestep_study.py` was consolidated into
+`src/diagnostics.py`. No schema, data contract, or numerical result changed.
+`DECISION_LOG.md` §12.
 
 **Roadmap.** Resolve the timestep question → swap the kinematic block for the
 dVRK PSM → scale up data collection → graph network → MPM/Neo-Hookean tissue for
