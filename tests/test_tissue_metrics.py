@@ -439,3 +439,62 @@ class TestExposureInputValidation:
     def test_non_positive_sigma_raises(self):
         with pytest.raises(ValueError, match="sigma"):
             compute_exposure(slab([0, 0]), ORIGIN, NORMAL, EXTENT, sigma=0.0)
+
+
+class TestExposureWeights:
+    """`weights` exists because coverage is a SUM of unit Gaussians against an
+    absolute threshold: the same geometry carried by fewer particles reads as
+    less covered (DECISION_LOG.md section 13.3). Self-contained geometry, so the
+    particle density these tests depend on is written down here."""
+
+    O = np.array([0.0, 0.0, 0.0])
+    N = np.array([0.0, 0.0, 1.0])
+    E = np.array([0.02, 0.02])
+
+    def _sheet(self, step=1):
+        """1 mm grid over +-40 mm, 10 mm above the target: fully covers it."""
+        a = np.arange(-0.040, 0.040 + 1e-9, 0.001)[::step]
+        xx, yy = np.meshgrid(a, a, indexing="ij")
+        return np.stack([xx.ravel(), yy.ravel(), np.full(xx.size, 0.010)], axis=-1)
+
+    def test_default_and_unit_weights_are_bit_identical(self):
+        # WHY: the new argument must not change a single existing result.
+        p = self._sheet(step=3)
+        base = compute_exposure(p, self.O, self.N, self.E)
+        assert np.array_equal(base, compute_exposure(p, self.O, self.N, self.E, weights=None))
+        assert np.array_equal(base, compute_exposure(p, self.O, self.N, self.E,
+                                                     weights=np.ones(len(p))))
+
+    def test_sparse_subset_collapses_unweighted_and_recovers_weighted(self):
+        # WHY: the finding itself, demonstrated. A 20 mm subset of a fully
+        # covering sheet sums to ~0.2 between particles (sigma 4 mm), under the
+        # 0.5 threshold, so it reads CLEAR although the geometry is unchanged.
+        # Weighting each kept particle by the count it replaces restores cover.
+        full = self._sheet()
+        sub = self._sheet(step=20)
+        assert hard_exposure(full, self.O, self.N, self.E) == 0.0
+        assert hard_exposure(sub, self.O, self.N, self.E) > 0.5
+        w = np.full(len(sub), len(full) / len(sub))
+        assert hard_exposure(sub, self.O, self.N, self.E, weights=w) < 0.05
+
+    def test_per_particle_weights_broadcast_over_time(self):
+        frames = np.stack([self._sheet(step=10) + [d, 0.0, 0.0] for d in (0.0, 0.03, 0.06)])
+        w = np.linspace(1.0, 3.0, frames.shape[1])
+        batched = compute_exposure(frames, self.O, self.N, self.E, weights=w)
+        single = [compute_exposure(f, self.O, self.N, self.E, weights=w) for f in frames]
+        assert np.allclose(batched, single)
+
+    @pytest.mark.parametrize("bad", [-1.0, np.nan, np.inf])
+    def test_invalid_weights_raise(self, bad):
+        # WHY: a negative weight un-occludes and a NaN poisons every query point,
+        # both silently. They must fail loudly instead.
+        p = self._sheet(step=10)
+        w = np.ones(len(p))
+        w[0] = bad
+        with pytest.raises(ValueError, match="weights"):
+            compute_exposure(p, self.O, self.N, self.E, weights=w)
+
+    def test_wrong_shape_raises(self):
+        p = self._sheet(step=10)
+        with pytest.raises(ValueError, match="broadcast"):
+            compute_exposure(p, self.O, self.N, self.E, weights=np.ones(len(p) + 1))
