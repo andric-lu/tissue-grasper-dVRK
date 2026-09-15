@@ -6,6 +6,9 @@
    layer (§8) — *reconstructed from source on 17 August, see the note there*
 3. 17 August 2026 · Documentation recovered into git, boundary_mask bug, MPM
    route settled (§9)
+4. 31 August 2026 · The dVRK PSM and a persistent grasp (§10)
+5. 15 September 2026 · Phase 0 of the MPM→GNN brief: locality, coarsening,
+   graph statistics, MPS scatter-add — measured before building (§13)
 
 **Objective:** A dynamics model that predicts soft tissue response during
 deformation and external disturbance, starting with basic tissue retraction.
@@ -2165,7 +2168,8 @@ Every path below was checked against the repository on 17 August 2026; the
 four §9.7 rows were added on 26 August 2026; the `psm_Si_model`/`psm.py`/
 `smoke_test_psm.py` rows were added on 31 August 2026 (§10); the
 `grasp_constraint.py`/`smoke_test_grasp.py` rows and the `psm.py`/
-`mpm_adapter.py`/`validate_dataset.py` updates were added the same day (§10.7).
+`mpm_adapter.py`/`validate_dataset.py` updates were added the same day (§10.7);
+the Phase 0 rows were added on 15 September 2026 (§13).
 
 **Correction.** Earlier versions of this table listed files that had been written
 during a session but never saved to disk. `container/validate_physics.py` was one
@@ -2214,12 +2218,20 @@ copy is the shareable view, not the only copy.
 | `src/energy_ledger.py` | **both** | Closed mechanical-energy budget, exponent fit, verdict | §9.7 |
 | `host/mpm_energy.py` | macOS | Instrumented MPM driver: split kernels, grid probes, known ICs | §9.7 |
 | `host/energy_audit.py` | macOS | Energy audit, 5 selftests + 3 cells, one child per row | §9.7, **run** |
+| `src/graph_design.py` | **both** | Influence radius with status, node samplers, radius graph, components, hop diameter | §13 |
+| `src/damping.py` | **both** | Kelvin–Voigt / mass damping decay rates, viscous stability limit | §13.2 |
+| `host/mps_scatter_check.py` | macOS | MPS scatter-add correctness vs CPU/float64, message-passing throughput | §13.5, **run** |
+| `host/mpm_locality_study.py` | macOS | Local-kick influence radius; 3 materials × 2 configs × 5 damping; `--selftest`, `--replot` | §13.2, **run** |
+| `host/locality_attribution.py` | macOS | Same probe at 55/110/220 substeps: physical vs numerical coupling | §13.2, **run** |
+| `host/coarsening_study.py` | macOS | Safety/exposure fidelity vs node count and sampler | §13.3, **run** |
+| `host/graph_stats.py` | macOS | Degree (surface/interior), components, hop diameter vs R/h; M criterion | §13.4, **run** |
+| `figures/phase0/` | — | Committed Phase 0 figures | §13 |
 | `container/verify_container.py` | Linux | Physics + SurRoL checks | |
 | `container/make_tissue_mesh.py` | Linux | Author the tissue sheet | |
 | `container/collect_retraction.py` | Linux | Scripted retraction episodes | |
 | `container/timestep_study.py` | Linux | Convergence study | **never run** (§4) |
 | `container/validate_physics.py` | Linux | Nine controlled physics experiments | **never run** |
-| `tests/` | macOS | 279 unit tests, five files | §8.7, §9.7 |
+| `tests/` | macOS | 320 unit tests, seven files | §8.7, §9.7, §13 |
 
 **Data and artifacts** (git-ignored):
 
@@ -2227,6 +2239,8 @@ copy is the shareable view, not the only copy.
 |---|---|
 | `data/` | 20 PyBullet retraction episodes, schema v1.0, 1 Aug |
 | `data_synth/` | 4 analytic episodes, schema v2.0, regenerate with `synthetic_traj.py` |
+| `data_mpm_full/` | 1 full-resolution (24,000-particle) grasp episode for §13.3, regenerable |
+| `runs/` | Phase 0 study outputs: `locality/`, `coarsening/` (incl. `nodesets.npz`), `graph_stats*/`, `phase0/` |
 | `models/dynamics_mlp.pt` | MLP baseline, 1 Aug |
 | `assets/tissue_20x20.obj` | Authored tissue mesh (tracked) |
 
@@ -2240,3 +2254,427 @@ copy is the shareable view, not the only copy.
 - *Autonomous Soft Tissue Retraction Using Demonstration-Guided RL* — [arXiv:2309.00837](https://arxiv.org/abs/2309.00837)
 - Long et al., *Surgical embodied intelligence for generalized task autonomy*, Science Robotics 2025
 - [Isaac Sim requirements](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/requirements.html) · [Isaac Sim cloud deployment](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_cloud.html)
+
+---
+
+## 13. Session 5 — 15 September 2026: Phase 0 of the MPM→GNN brief, measured before building
+
+A brief arrived proposing a graph network over the MPM tissue, organised as
+Phases 0–6. Its central argument is sound: a GNN is a local model (M
+message-passing steps over radius R see M·R of the object), while
+near-incompressible tissue is globally coupled over one recorded step. Its
+Phase 0 is four measurements that choose the graph node count, the connection
+radius, the recording rate and the damping before anything is built.
+**This session did Phase 0 only, on the MPM scene as it exists.** Both scope
+limits were agreed before any code was written, because Phases 1–6 cannot be
+specified honestly until these four numbers exist. Work is on branch
+`phase0-measure`, one commit per step.
+
+The short version, before the detail:
+
+- **The brief's geometry, rate and several repo facts were wrong** (§13.1).
+  Every number below uses the real scene.
+- **At the current 80 Hz, one recorded step couples the whole slab**, and no
+  node set passes at M = 10. **At 240 Hz every candidate node set passes at
+  M = 10.** But the far-field part of that coupling is the solver's transfer
+  stencil, not elastic waves: it grows with substep count at fixed physical
+  time (§13.2).
+- **Damping does not localise the response** at any tested level. Mass damping
+  cannot, by construction; Kelvin–Voigt diffuses momentum outward (§13.2).
+- **float32 discards volumetric strain increments below
+  ~ulp(1)/(2·dt)** — 7.9e-4 s⁻¹ at 55 substeps/frame — while keeping shear
+  (§13.2). This is a solver finding, not a GNN one.
+- **No node set up to 3,000 carries the peak safety stretch** (best worst-seed
+  0.84 of the excess). Weighted exposure is fine from ~450 nodes. Unweighted
+  exposure is broken by construction on any subset (§13.3).
+- **MPS scatter-add is correct.** Batched inference is **0.05%** of an MPPI
+  budget whose unit the brief also got wrong (§13.5).
+
+### 13.1 The brief against the repository
+
+Checked before planning, by reading the code rather than the brief:
+
+| Brief assumes | Repository has | Evidence |
+|---|---|---|
+| 100×100×10 mm clamped sheet | **300×300×50 mm** random cloud, 24,000 particles, **no clamp** | `mpm3d.py:363` `init_cube`; adapter writes `boundary_mask` all False |
+| particle spacing 2.5 mm | mean spacing **5.72 mm**; grid dx **15.6 mm**; slab **3.2 cells thick** | `MPM/config.py` n_grid = 64 |
+| 30 Hz recording | **80 Hz** (`frame_dt = 0.0125`) | `mpm_adapter.py:135` |
+| damping is a new option | the `*= 0.1` floor band already removes 89–93% of energy | §9.7 cell 3 |
+| schema v2.0; `src/checks.py`; "§12.1 cKDTree" | **v2.1**; no `checks.py`; §12 is References; scipy used nowhere; `src/` must stay numpy-only | `trajectory_io.py:190` |
+| `host/collect_mpm.py` | `host/mpm_adapter.py` exists and is the adapter | — |
+
+**Wave reach, recomputed.** ρ = 1050 kg/m³; R = 1.5·h = 8.6 mm if the nodes
+were the particles.
+
+| material | c_p (m/s) | reach in 1/80 s | 1/30 s | 1/240 s | M needed at 80 Hz if nodes = particles |
+|---|---|---|---|---|---|
+| soft (μ = 200, λ = 2e4) | 4.4 | 55 mm | 147 mm | 18 mm | 6 |
+| mid (μ = 2e3, λ = 2e5) | 13.9 | 174 mm | 465 mm | 58 mm | 20 |
+| stiff (μ = 2e4, λ = 2e6) | 44.1 | 551 mm | 1469 mm | 184 mm | 64 |
+
+For M = 10 over a 300 mm object the brief's own coarsening formula gives
+h_graph ≥ 20 mm, ~560 nodes — coarser than the solver grid, and only ~2.5 nodes
+through the slab's thickness.
+
+**Three findings from the arithmetic alone:**
+
+1. **`compute_exposure` is not resolution-invariant.** `_coverage` *sums* unit
+   Gaussians (σ = 4 mm) and compares the sum against an absolute 0.5. Under the
+   full slab coverage is ~27; the same geometry on 600 nodes sums to ~0.67, on
+   150 to ~0.17 — every query point reads "clear" under complete cover. Fixed
+   by an optional `weights` argument (commit `635e367`); measured in §13.3.
+2. **`p_vol = (dx/2)³` assumes 8 particles per cell; the cloud has 20.3.**
+   Total mass, gravity load and energy are 2.54× the geometric body. Stress and
+   mass both scale with `p_vol`, so wave speeds and accelerations are
+   unaffected; any *extensive* readout (mass, contact force, absolute energy —
+   including §9.7's joules) is 2.54× off. **Not fixed.** It must be decided
+   before Phase 1 records a `particle_volume` field.
+3. **The brief's MPC budget has the wrong unit.** It states S·H·30 = 230,000
+   "node updates per second" (S = 256, H = 30, 30 Hz). That is *forward passes*.
+   Each pass evaluates every edge in every block, so the requirement is
+   S·H·f·E·M = **1.9 × 10¹⁰ edge-block evaluations/s** at n = 600, E = 8,400,
+   M = 10 — five orders of magnitude above the brief's figure. §13.5 measures
+   against the corrected number.
+
+### 13.2 Locality: how far a local kick travels in one recorded step (study 0.1)
+
+`host/mpm_locality_study.py`, reusing `mpm_energy.Instrument` and
+`energy_audit.py`'s one-child-per-row dispatch.
+
+**The probe is not the brief's.** The brief displaces one particle's
+*position*. In MPM stress comes from each particle's carried F, so a moved
+particle with unchanged F exerts no extra stress — that probe measures the
+quadrature, not the material — and it is one of ~20 particles in its cell, so
+the first scatter dilutes it ~20×. Perturbing F on a patch was the other
+option; rejected because its amplitude is hard to relate to network inputs.
+**Chosen: a velocity impulse on the ~12 particles within dx/2 of a probe
+particle**, along x (in-plane, the P-wave) and z (normal, bending), at a centre
+probe and an edge probe.
+
+From one base state, five runs: A, A′ (unkicked, twice), B, B′ (kicked, twice),
+B2 (kicked ×2). Response = |v_B − v_A| per particle, binned by distance, divided
+by the patch's own response. `graph_design.influence_radius` returns the radius
+with a status: `saturated` = still above threshold at the far edge (a lower
+bound), `below_noise` = threshold under the noise floor (refused). Snapshots
+after 1, 2, 3, 4 and 8 frames of 1/240 s give every recording interval from one
+run.
+
+**Sweep:** soft/mid/stiff corners of `materials.py` × `clean` (g = 0, lifted
+clear, no-contact asserted every frame) and `as_collected` (g = 9.8, settled
+0.75 s onto the floor band) × damping {none, Kelvin–Voigt at two levels, mass
+at two levels}. One substep count per material across all damping levels (55
+per 1/240 s frame, set by the strongest viscosity's stability limit), because
+§9.7 showed dissipation shifts with substep count.
+
+#### The selftest failed twice, and both failures were real
+
+**Failure 1: linearity 1.45 at a 0.01 m/s kick.** Diagnosed by measurement
+(soft, clean, 55 substeps/frame, substep 75.8 µs):
+
+| kick | band | linearity median | `dt·max|C|` < ulp(1)/2 | diagonal ΔF exactly 0 | off-diagonal ΔF exactly 0 | median \|J − 1\| |
+|---|---|---|---|---|---|---|
+| 0.01 m/s | 0–20 mm | 2.14 | 99% | 0.6% | 0% | 7.8e-6 |
+| 0.01 m/s | 60–120 mm | 1.89 | 94% | 81% | 0% | 9.7e-13 |
+| 0.01 m/s | 120–350 mm | **1.17** | 100% | **100%** | **0%** | **1.3e-14** |
+| 1 m/s | 120–350 mm | 2.000 | 0% | 0.9% | 0% | 1.4e-5 |
+
+`P2G` updates `F ← (I + dt·C)·F` in float32. When |dt·C_ii| < ulp(1)/2 =
+5.96e-8, `1 + dt·C_ii` rounds to exactly 1 and the increment is lost. The
+off-diagonal entries start at 0, where a tiny number is represented exactly,
+so they survive. **The solver therefore drops volumetric/normal strain
+increments below a strain-rate floor while keeping shear — and volumetric is
+precisely the pressure channel that carries the P-wave.** The floor is
+ulp(1) / (2·dt):
+
+| setting | substep | normal strain-rate floor |
+|---|---|---|
+| locality study, 55 per 1/240 s | 75.8 µs | 7.9e-4 s⁻¹ |
+| `data_mpm/` soft-λ episode, 24 per 1/80 s | 521 µs | 1.1e-4 s⁻¹ |
+| `data_mpm/` stiff-λ episode, 106 per 1/80 s | 118 µs | 5.1e-4 s⁻¹ |
+
+It *rises* with substep count. That qualifies §9.7's "refining dt at fixed dx is
+a legitimate instrument": it is, until the floor bites. Metal has no float64
+(§10), so the obvious fix is unavailable. At 1 m/s the physics is still linear
+— the patch response is 3.1e-3 of the kick at 0.1 and at 1 m/s — so the kick
+is now **1 m/s**, and linearity is checked **per distance band**, because an
+overall median hid a far-field failure once.
+
+**Failure 2: the at-rest control pair is vacuous.** The clean base state is
+exactly at rest, so A and A′ sum only zeros and |A′ − A| = 0 by construction.
+Selftest check 6 (refusal on noise) never reached the refusal branch as a
+result. The repeated kicked pair |B′ − B| carries the real run-to-run noise
+(8.3e-8 m/s); the floor is now the larger of both pairs and the float32
+spacing.
+
+**Selftest, as passed:**
+```
+[PASS] kv_eta0_matches_solver             KV(eta=0) vs vendored 1.0 ulp; solver's own floor 1.0 ulp
+[PASS] kv_leaves_rigid_translation        eta=83.1 Pa*s: E(T)/E(0) = 1.0000011
+[PASS] mass_fails_rigid_and_matches_closed_form   E(T)/E(0) = 0.513416 vs exp(-2 alpha T) = 0.513417
+[PASS] kv_dissipates_at_order_of_predicted_rate   0.22x continuum at a 3-cell wavelength
+[PASS] probe_is_linear_in_every_band      2.000 / 2.000 / 1.999 / 2.000; floor 8.3e-8 m/s
+[PASS] noise_only_is_refused              kicked control pair -> below_noise
+```
+
+#### Results
+
+1% velocity-influence radius (mm), centre probe, kick along x, **no damping**.
+`>=N` = saturated. Centre-to-corner distance is ~234 mm.
+
+| config | material | 1/240 s | 1/120 s | 1/80 s | 1/60 s | 1/30 s |
+|---|---|---|---|---|---|---|
+| clean | soft | 130 | 195 | ≥215 | ≥215 | ≥215 |
+| clean | mid | 160 | ≥215 | ≥215 | ≥215 | ≥215 |
+| clean | stiff | 170 | ≥215 | ≥215 | ≥215 | n/r |
+| as_collected | soft | 145 | 225 | ≥230 | ≥230 | ≥230 |
+| as_collected | mid | 175 | ≥215 | ≥215 | n/r | ≥215 |
+| as_collected | stiff | n/r | ≥215 | ≥215 | n/r | n/r |
+
+Full tables for both probes, both axes, both thresholds and all damping levels:
+`runs/locality/tables.md`. Figures: `figures/phase0/locality_*.png`.
+
+**The soft material's influence outruns its P-wave by 7×.** At 1/240 s,
+c_p·t = 18 mm but r₁% = 130 mm, so something other than elastic waves carries
+the far field. Two candidates were separated by holding physical time fixed and
+changing only the substep count (`host/locality_attribution.py`):
+
+| soft, t = 4.2 ms (c_p·t = 18 mm) | resp/src @ 50 mm | @ 150 mm | @ 200 mm | r₁₀% | r₁% |
+|---|---|---|---|---|---|
+| 55 substeps/frame | 0.77 | 5.9e-3 | 1.1e-3 | 80 | 130 |
+| 110 | 0.82 | 2.0e-2 | 3.4e-3 | 90 | 185 |
+| 220 | 0.84 | 7.3e-2 | 3.6e-2 | 100 | ≥215 |
+
+- **The far tail is numerical.** Physical propagation over 4.2 ms cannot depend on
+  the substep count; this tail grows up to 30×. Each P2G/G2P pair spreads a
+  particle's momentum over ±1.5 dx twice, and more substeps are more transfers.
+- **The near field (≤ ~3 dx ≈ 47 mm) is set by the grid, not by c_p**, and does
+  not change with substep count: one transfer already couples everything within
+  the stencil.
+- **Stiff is physically global**: c_p·t exceeds the object at every interval,
+  responses exceed the source (ringing), and many stiff cells are `n/r` because
+  run-to-run noise reaches 2–37% of the response.
+- **A momentum-free kick was tried and rejected.** Subtracting the patch impulse
+  from every particle puts a uniform ~5e-4 m/s into B − A itself, so its far
+  field rose instead of falling.
+
+**For the learning problem the distinction matters twice.** The network learns
+the solver, so the numerical tail *is* in the target, and it gets worse as
+substeps increase. And "record faster" helps by shortening the interval, not by
+removing a physical wave.
+
+**Damping does not localise, and neither form could have been expected to:**
+
+- **Mass damping** multiplies every velocity by the same factor, so
+  response/source keeps its shape. The `mass_slow` curves match `none`.
+- **Kelvin–Voigt viscosity** damps high wavenumbers but *diffuses* momentum:
+  at η = 83 Pa·s, √(νt) is ~18–26 mm at 1/240 s and ~31–44 mm at 1/80 s
+  (transverse–longitudinal). The `kv_fast` far field sits higher, not lower.
+
+The brief's option B1 (add damping to make the dynamics local) is rejected on
+this evidence. The hook stays in `Instrument.set_damping()` (commit `59f17e4`)
+because tissue *is* viscoelastic; what η real tissue has is a literature
+question this session does not answer.
+
+**What this does not establish.** Damping levels were chosen by decay time, not
+measured tissue viscosity, and the material ranges are still placeholders.
+
+### 13.3 Coarsening: how few nodes carry the metrics (study 0.2)
+
+`host/coarsening_study.py` on one full-resolution grasp episode:
+`mpm_adapter.py --task grasp --n-record 24000 --out data_mpm_full` (51 rows,
+46.6 MB, validates 14 PASS / 1 WARN / 0 FAIL — the WARN is det F ∈ [0.40, 1.25]
+around the grasp). A grasp and not a settle, because a settling slab stretches
+~1.0 everywhere and any subset would agree. Frame 0 is asserted to be the rest
+state (max|F − I| = 0.0). Node sets are chosen once in rest space.
+
+**Acceptance, fixed before any result was seen:** in every seed, peak excess
+ratio (max_c − 1)/(max_f − 1) ≥ 0.90, soft-stretch error ≤ 0.01, weighted hard
+exposure error ≤ 0.05. Exposure is scored on the episode — whose target is
+covered in every frame — **and** on an 11-step synthetic lateral shift of the
+rest cloud across the target (geometry only), so the partially exposed range is
+tested too.
+
+| sampler | n | peak excess (worst / mean) | soft err | weighted exposure err | unweighted exposure err | OK |
+|---|---|---|---|---|---|---|
+| FPS | 450 | 0.49 / 0.65 | 0.021 | 0.039 | 0.66 | no |
+| FPS | 600 | 0.49 / 0.74 | 0.024 | 0.035 | 0.54 | no |
+| FPS | 3000 | 0.81 / 0.91 | 0.005 | 0.023 | 0.06 | no |
+| surface-quota FPS | 450 | 0.61 / 0.64 | 0.009 | 0.035 | 0.65 | no |
+| surface-quota FPS | **600** | **0.66 / 0.69** | **0.007** | **0.023** | 0.51 | no |
+| surface-quota FPS | 3000 | 0.73 / 0.82 | 0.006 | 0.027 | 0.06 | no |
+| lattice | 1800 | 0.84 / 0.84 | 0.003 | 0.055 | 0.09 | no |
+| random (the adapter's method) | 3000 | 0.74 / 0.81 | 0.010 | 0.020 | 0.07 | no |
+
+Full table: `runs/coarsening/table.md`; figure `figures/phase0/coarsening.png`.
+
+- **No sampler and n ≤ 3,000 is acceptable. The failing criterion is always the
+  peak.** A maximum over a subset is biased low (§9.5's rule 2), and here the peak
+  concentrates on a handful of particles.
+- **56% of the 146 over-threshold particles at the peak frame are within one grid
+  cell of a grasp-constrained particle.** The safety peak is partly the grasp
+  constraint's own artefact (§10.7), not tissue response.
+- **Weighted exposure is within 0.035 from n = 450** with FPS or surface-quota
+  sampling. **Unweighted exposure reads 0.90 "clear" under full cover at
+  n = 150** — the §13.1 collapse, shown.
+- **The lattice sampler puts 0–8% of its nodes on the surface**, against ~29% of
+  particles. That matters for exposure (lattice needs n ≈ 3,000) and for §13.4's
+  surface degree.
+
+**The safety peak is a decision for Andric, not a parameter.** Options:
+(a) keep full-resolution metrics as ground truth and train a learned
+peak-correction head on node features; (b) upsample F from nodes to particles
+(PhysWorld's skinning) — cannot recover a peak no node sees unless the upsampler
+is learned; (c) redefine the constrained quantity as a coarse-stable statistic
+(neighbourhood power mean, top-k fraction); (d) treat the grasp-neighbourhood
+peak separately, since over half of it is the constraint. **Recommendation:
+investigate (d) first — it is cheap and may remove most of the gap — then (a).**
+
+### 13.4 Graph statistics: what graph those nodes make (study 0.3)
+
+`host/graph_stats.py`. Pitch h is measured (median nearest-neighbour distance),
+R = ratio·h over [1.2, 2.5]. Acceptance: one component, mean degree 10–20,
+minimum degree ≥ 3, M_needed = ⌈r₁%/R⌉ ≤ M, and diameter ≤ M whenever the
+influence saturates.
+
+**A bug in the first version, caught before it reached this log.** It took the
+largest influence radius over all cells and kept *that cell's* status. A
+resolved 245 mm edge-probe cell then outranked five saturated ≥215–230 mm
+centre-probe cells, the diameter criterion was never applied, and graphs with
+13–18-hop diameters passed at M = 10. Saturation is now sticky.
+
+**Results for surface-quota FPS, n = 600** (h = 18.7 mm):
+
+| R/h | R | mean degree (interior / surface) | min | components | hop diameter |
+|---|---|---|---|---|---|
+| 1.4 | 26.1 mm | 5.8 (7.4 / 4.3) | 0 | 3 | — |
+| 1.5 | 28.0 mm | 7.4 (9.0 / 5.7) | 1 | 1 | 21 |
+| **1.7** | **31.7 mm** | **10.5 (12.4 / 8.5)** | **3** | **1** | **18** |
+| 2.0 | 37.3 mm | 15.5 (18.4 / 12.5) | 4 | 1 | 15 |
+| 2.5 | 46.7 mm | 28.0 (32.9 / 23.1) | 6 | 1 | 11 |
+
+- **Surface nodes run ~30% below interior degree** at every R: the slab is only a
+  few node pitches thick, so half a surface node's neighbourhood sphere is empty.
+- **At 1/80 s (current data): no node set passes at M = 10.** Five of twelve
+  influence cells saturate, and diameters are 13–29 hops. Sweeping M: M = 12
+  passes only the n = 450 sets; M = 14 passes all four tested; M = 18 reaches the
+  smallest R (1.7h).
+- **At 1/240 s: every node set passes at M = 10** with R = 1.7–1.9h. No cell
+  saturates; the largest radius is 185 mm (stiff, edge probe), so M_needed = 6
+  at R = 31.7 mm.
+- **Broken-input demonstration built in:** R = 0.5h shatters every set into n
+  components, or the script exits non-zero.
+
+Figure: `figures/phase0/graph_stats.png`; results `runs/graph_stats/` (1/80 s)
+and `runs/graph_stats_240/` (1/240 s).
+
+### 13.5 MPS scatter-add: correct, and far too slow for MPPI (study 0.4)
+
+`host/mps_scatter_check.py`, torch 2.13.0. Message passing is a scatter-add,
+written by hand because torch_geometric has no Metal path, and a scatter that
+silently drops duplicate-index writes trains to a plateau with no error.
+
+- **Exact-integer `index_add_` is bit-identical to CPU** up to E = 10⁶, including
+  every edge into one node. Integers < 2²⁴ sum exactly in any order, so there is
+  no tolerance to argue about.
+- **Float forward and gradients: MPS error vs float64 is no worse than CPU
+  float32's** (ratio 1.05 forward, 0.23 gradients; limit 4). **The first version
+  FAILED both** with hand-picked 1e-5 / 1e-4 tolerances; measured against
+  float64, the CPU was further from the truth than MPS at E = 10⁶. Summing
+  ~1,700 float32 terms per node accumulates rounding a fixed tolerance cannot
+  follow. The first gradient run also crashed — a test bug (`.to("cpu")` returns
+  the same tensor, so `requires_grad_` leaked into the shared input).
+- **Each criterion is shown to fail:** a permuted index, one dropped message
+  (8,169× CPU rounding) and one mis-routed edge in the gradients (3,012×) are all
+  flagged.
+
+**Throughput**, one GNS-shaped block (3-layer 128-wide edge and node MLPs,
+LayerNorm, residual):
+
+| graph | MPS inference | MPS train | CPU inference | CPU train |
+|---|---|---|---|---|
+| n = 600, E = 8,400 | 1.1e7 edges/s | 5.0e6 | 1.7e6 | 7.7e5 |
+| n = 1800, E = 36,000 | 1.4e7 | 5.8e6 | 3.0e6 | 1.3e6 |
+| MPPI batch, S = 256 × n = 600 | 9.2e6 | 3.6e6 | — | — |
+
+**Against the corrected budget of 1.94 × 10¹⁰ edge-blocks/s, batched MPS
+inference is 0.05% — about 2,100× short.** Levers, none chosen: timestep bundling
+(m = 8 cuts H by 8), fewer samples or a shorter horizon, fewer blocks, a coarser
+graph, a real GPU, or a grid processor. Training on MPS at this scale is viable
+for prototyping; the real runs belong on the cluster, as the brief expected.
+
+### 13.6 The four numbers, with what each costs
+
+| decision | value | status | the error being accepted |
+|---|---|---|---|
+| node set | **n = 600, surface-quota FPS** (50% surface) | provisional | peak excess stretch seen 0.66 (worst seed) — `safety_strain.max` is **not** carried; weighted exposure within 0.023; soft stretch within 0.007 |
+| radius | **R = 1.7h ≈ 32 mm** | provisional | mean degree 10.5; surface nodes 8.5; minimum 3 |
+| recording rate | **1/240 s** | recommended | 3× the frames of the current 80 Hz. The far-field coupling it resolves is partly the solver's stencil and grows with substeps |
+| damping | **none** | measured | neither form localises; physical tissue viscosity unknown |
+| message passing | **M = 10** at 1/240 s (M_needed = 6) | follows | at 1/80 s the same graph needs M ≥ 14–18 |
+
+**Why 600 and not 450:** at 450, weighted exposure (0.035) and peak ratio
+(0.61) are both worse, for a hop diameter only two smaller. The alternative is
+recorded; the difference is not large.
+
+### 13.7 Phases 1–6, annotated by what Phase 0 changed
+
+Not implemented. Each line is a correction to the brief as written.
+
+- **Phase 1.** Extend `mpm_adapter.py`, do not add `collect_mpm.py`.
+  - Record at 240 Hz.
+  - Decide particles-per-cell before writing `particle_volume` (§13.1 finding 2).
+  - The brief's §1.5 boundary retune is moot until a clamp exists — there is none.
+  - Lattice seeding interacts with surface starvation (§13.3, §13.4).
+  - Record `tissue_C`, knowing its small diagonal increments are already below
+    float32 resolution at high substep counts.
+- **Phase 2.** Schema 2.1 → 3.0, not 2.0 → 3.0. Storage at 240 Hz is 3× the
+  current frames before `tissue_C`.
+- **Phase 3.** `check_coarse_metrics_track_fine` cannot use a 0.9 peak criterion:
+  no node set up to 3,000 passes it. Check weighted exposure, and *report* the
+  peak ratio. `check_graph_diameter` must know the recording rate — at 80 Hz it
+  fails by construction.
+- **Phase 4.** Brute force was enough for Phase 0's ≤ 3,000 static nodes; world
+  edges rebuilt every step are the case that may need scipy in `src/` (and the
+  container's numpy 1.23).
+- **Phase 5.** The MPPI budget (§13.5) should shape the architecture from the
+  start, not be discovered in Phase 6. Timestep bundling is no longer optional.
+  Exposure heads or losses on a node subset must use `weights`.
+- **Phase 6.** Unchanged.
+
+### 13.8 Still open
+
+- **The safety peak** (§13.3): options (a)–(d), Andric's decision.
+- **The float32 volumetric strain-rate floor** (§13.2): no fix chosen. Metal has
+  no f64, and more substeps raise the floor.
+- **`p_vol` vs particles per cell** (§13.1): extensive quantities 2.54× off.
+- **The MPPI budget** (§13.5): 2,100× short.
+- **Tissue viscosity** from literature, and whether that η localises anything.
+- **The locality study ran on one probe patch size and one kick amplitude.** The
+  1 m/s choice is justified by linearity, not by a sweep.
+- **Not verified this session:** `src/graph_design.py` and `src/damping.py`
+  importing under the container's numpy 1.23 (no numpy-2-only API is used, but
+  it was not run); the dataviz palette's colour-vision checks (no Node runtime on
+  this machine; contrast was computed instead — every ramp step ≥ 2.06:1).
+
+### 13.9 Verification
+
+```
+pytest tests/ -q                                          320 passed
+python host/energy_audit.py --selftest                    SELFTEST PASSED (after the damping hook)
+python host/mps_scatter_check.py                          6 PASS, 1 WARN (budget), 0 FAIL
+python host/mpm_locality_study.py --selftest              6/6 PASS
+python host/mpm_locality_study.py                         30/30 rows, 342 s
+python host/locality_attribution.py                       6 children, 27 s
+python host/mpm_adapter.py --task grasp --n-record 24000 --out data_mpm_full
+python host/validate_dataset.py --data data_mpm_full/     14 PASS, 1 WARN, 0 FAIL
+python host/coarsening_study.py --data data_mpm_full/     no sampler acceptable (as reported)
+python host/graph_stats.py --samplers surface_quota fps lattice --n 450 600 900 --frames 1
+                                                          all 9 acceptable; broken-input PASS
+```
+
+Checks shown failing on broken input this session: four source mutations of
+`graph_design.py`, each caught by exactly its target test; below-noise refusal
+on real solver noise; mass damping failing the rigid-translation invariance
+Kelvin–Voigt passes; a permuted index, a dropped message and a mis-routed edge
+in the scatter check; R = 0.5h shattering every node set; unweighted exposure
+reading clear under full cover.

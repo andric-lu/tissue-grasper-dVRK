@@ -40,7 +40,7 @@ host-only — not a preference, the wheel does not exist (§9.3).
 ```bash
 # host
 conda activate tissue-host
-pytest tests/ -q                                    # 279 tests
+pytest tests/ -q                                    # 320 tests
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
@@ -49,6 +49,13 @@ python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
 python host/substep_study.py --frames 60            # §9.6; ~3 min, both materials
 python host/energy_audit.py --selftest              # §9.7 D1 gate, ~40s
 python host/energy_audit.py --frames 60             # §9.7; ~5 min, 3 cells
+python host/mps_scatter_check.py                    # §13.5; ~1 min, exit != 0 on FAIL
+python host/mpm_locality_study.py --selftest        # §13.2 gate, ~10 s
+python host/mpm_locality_study.py                   # §13.2; ~6 min, 30 rows; --replot redraws
+python host/locality_attribution.py                 # §13.2; ~30 s
+python host/mpm_adapter.py --task grasp --n-record 24000 --out data_mpm_full
+python host/coarsening_study.py --data data_mpm_full/   # §13.3; ~4 min; --replot redraws
+python host/graph_stats.py --n 450 600 900 --frames 1   # §13.4; seconds
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
@@ -342,6 +349,40 @@ established that you need to know:
   too many compounded rotated offsets to hand-derive reliably.
 - **Trocar-pivot (RCM-constrained) motion is not implemented.** IK is
   free-space 6-DOF; the URDF's `RCM` link is visual-only.
+
+### Phase 0 of the MPM→GNN brief — measured, nothing built (§13)
+
+Branch `phase0-measure`. Phases 1–6 are **not** implemented; §13.7 lists what
+Phase 0 changed about them. Before touching any of it:
+
+- **The MPM scene is 300×300×50 mm at 80 Hz with no clamp**, not the brief's
+  100×100×10 mm clamped sheet at 30 Hz. Grid dx 15.6 mm; the slab is 3.2 cells
+  thick.
+- **float32 drops volumetric strain increments below ulp(1)/(2·dt)** (7.9e-4
+  s⁻¹ at a 76 µs substep) and keeps shear. `1 + dt·C_ii` rounds to 1. More
+  substeps raise the floor. Any small-amplitude probe of this solver must
+  check linearity per distance band — an overall median hid this once.
+- **At rest, a control-run pair is identically zero.** Measure noise on the
+  perturbed pair.
+- **The solver's far-field coupling is partly numerical**: at fixed physical
+  time it grows with substep count (`locality_attribution.py`). A GNN learns
+  it anyway.
+- **Damping does not localise.** `Instrument.set_damping()` (Kelvin–Voigt or
+  mass, split path only; `none` still uses the vendored `substep()`) is kept
+  for viscoelasticity, not locality.
+- **`compute_exposure` on any particle subset needs `weights=N/n`.** Coverage is
+  a sum; 150 unweighted nodes read "clear" under full cover.
+- **No node set up to 3,000 carries `safety_strain.max`** (best 0.84 of the
+  excess); 56% of the peak sits within one cell of the grasp. Open decision.
+- **Provisional numbers**: 600 surface-quota FPS nodes, R = 1.7h ≈ 32 mm,
+  record at 1/240 s, M = 10, no damping. At 1/80 s the same graph needs M ≥ 14.
+- **`p_vol` assumes 8 particles per cell; the cloud has 20.3**, so mass, force
+  and absolute energy are 2.54× the geometric body. Not fixed.
+- **MPS scatter-add is correct; batched inference is 0.05% of the MPPI budget.**
+  The brief's "230,000 node updates/s" is forward passes; the real unit is
+  S·H·f·E·M edge-block evaluations.
+- **Hand-picked float tolerances failed twice this session.** Score against a
+  float64 reference relative to CPU float32 instead.
 
 Material ranges in `materials.py` are still placeholders, so no result should be
 claimed from a model trained on this data yet.
