@@ -625,7 +625,7 @@ def plot_config(rows, config, probe, axis, path):
     dpi = 150
     px = 72.0 / dpi                         # one pixel in points at this dpi
     plt.rcParams.update({
-        "font.family": ["system-ui", "-apple-system", "Helvetica Neue", "Arial", "sans-serif"],
+        "font.family": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
         "font.size": 8, "text.color": INK, "axes.labelcolor": INK2,
         "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": AXIS,
         "axes.linewidth": 1 * px, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE,
@@ -637,7 +637,7 @@ def plot_config(rows, config, probe, axis, path):
         for j, lv in enumerate(levels):
             ax = axes[i][j]
             ax.set_yscale("log")
-            ax.set_ylim(1e-5, 3)
+            ax.set_ylim(1e-5, 50)      # stiff/mid ring up to ~20x ABOVE the source; do not clip it
             ax.grid(True, which="major", axis="y", color=GRID, linewidth=1 * px)
             for spine in ("top", "right"):
                 ax.spines[spine].set_visible(False)
@@ -686,6 +686,8 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true", help="run only the gate")
     ap.add_argument("--no-selftest", action="store_true", help="skip the gate (not advised)")
+    ap.add_argument("--replot", action="store_true",
+                    help="rebuild tables and figures from the JSON rows already in --runs; no solver")
     ap.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
     ap.add_argument("--materials", nargs="+", default=list(material_corners()),
                     choices=list(material_corners()))
@@ -718,6 +720,20 @@ def main(argv=None) -> int:
 
     mats = material_corners()
     t0 = time.time()
+    if args.replot:
+        rows = []
+        for config in args.configs:
+            for mat_name in args.materials:
+                for lv in args.levels:
+                    p = os.path.join(args.runs, f"{config}_{mat_name}_{lv}.json")
+                    if os.path.isfile(p):
+                        row = json.load(open(p))
+                        row["material"] = mat_name
+                        rows.append(row)
+        if not rows:
+            raise SystemExit(f"no rows in {args.runs} -- run the sweep first")
+        _write_report(rows, args)
+        return 0
     print("=" * 96)
     print("MPM LOCALITY STUDY -- DECISION_LOG.md section 13.2".center(96))
     print("=" * 96)
@@ -778,6 +794,12 @@ def main(argv=None) -> int:
                       f"r_1% {_fmt_radius(c['radii']['0.01']):>6} mm  "
                       f"linearity {c['linearity_median']:.3f}")
 
+    _write_report(rows, args)
+    print(f"Total wall time: {time.time() - t0:.0f}s")
+    return 0
+
+
+def _write_report(rows, args):
     report = ["# Locality study -- raw tables (DECISION_LOG.md section 13.2)", "",
               f"Radii in mm. `>=N` = saturated (influence reached the far edge; lower bound). "
               f"`n/r` = threshold below noise floor. `none` = nothing cleared the threshold.", ""]
@@ -801,8 +823,6 @@ def main(argv=None) -> int:
                 figs.append(p)
     print(f"\nTables: {os.path.join(args.runs, 'tables.md')}")
     print("Figures:\n  " + "\n  ".join(figs))
-    print(f"Total wall time: {time.time() - t0:.0f}s")
-    return 0
 
 
 if __name__ == "__main__":
