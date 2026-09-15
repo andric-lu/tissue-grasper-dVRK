@@ -85,6 +85,10 @@ SCALE, THRESHOLD = 1.0, 0.05  # substep()'s two arguments, as the adapter passes
 # assert_no_contact().
 CLEAN_MARGIN_CELLS = 5
 
+# Damping forms available on the split path. See Instrument.set_damping().
+DAMPING_NONE, DAMPING_KV, DAMPING_MASS = "none", "kelvin_voigt", "mass"
+DAMPING_KINDS = (DAMPING_NONE, DAMPING_KV, DAMPING_MASS)
+
 
 class CompileLockError(RuntimeError):
     pass
@@ -147,7 +151,44 @@ class Instrument:
 
         self._kernels = None
         self._cloud = None
+        self.damping = {"kind": DAMPING_NONE, "eta": 0.0, "alpha": 0.0}
         self._prepare_solver()
+
+    def set_damping(self, kind: str = DAMPING_NONE, *, eta: float = 0.0,
+                    alpha: float = 0.0) -> None:
+        """Choose the damping term the SPLIT path inserts between P2G and Boundary.
+
+        NOTHING IN third_party/ IS EDITED. Both forms are extra host-side kernels
+        run in the gap substep_split() already opens between P2G and Boundary,
+        while the grid still holds MOMENTUM (Boundary divides by mass).
+
+          kelvin_voigt   viscous Kirchhoff stress  tau_v = eta * (C + C^T), scattered
+                         with P2G's own stencil and scaling. C is APIC's velocity
+                         gradient, so this damps STRAIN RATE: a rigid translation
+                         has C = 0 and feels nothing; a rigid rotation has
+                         antisymmetric C and feels nothing either. That is the
+                         property tissue viscoelasticity has and the reason it is
+                         the physically defensible choice. Units: eta in Pa*s.
+
+          mass           grid momentum *= exp(-alpha * dt) every substep. Damps ALL
+                         motion, rigid included -- a grasp lifting the slab would
+                         feel drag toward zero velocity. Simplest possible form,
+                         kept as a comparison. Units: alpha in 1/s.
+
+        eta/alpha are captured into the kernels as compile-time constants, the
+        same way mpm3d captures dt. Changing them discards the compiled kernels
+        so the next substep recompiles with the new values -- which is what lets
+        one process (one particle cloud) compare damping settings directly.
+
+        With kind == "none", advance_frame() uses the VENDORED substep() and the
+        damping kernels are never built.
+        """
+        if kind not in DAMPING_KINDS:
+            raise ValueError(f"damping kind must be one of {DAMPING_KINDS}, got {kind!r}")
+        if eta < 0 or alpha < 0:
+            raise ValueError(f"eta and alpha must be >= 0, got eta={eta}, alpha={alpha}")
+        self.damping = {"kind": kind, "eta": float(eta), "alpha": float(alpha)}
+        self._kernels = None
 
     # -- setup -------------------------------------------------------------
     def _prepare_solver(self):
@@ -253,6 +294,15 @@ class Instrument:
         """One recorded frame, through the VENDORED substep(). n_substeps, never
         mpm3d.steps -- the module global is the vendored default and using it is
         what made frames advance the wrong amount of time in section 9.5."""
+        if self.damping["kind"] != DAMPING_NONE:
+            # A damping term only exists on the split path. Silently running the
+            # vendored substep() here would report an undamped result under a
+            # damped label -- the section 9.5 "decoration" bug class again.
+            for _ in range(n_frames):
+                for _ in range(self.n_substeps):
+                    self.substep_split()
+            self.ti.sync()
+            return
         for _ in range(n_frames):
             for _ in range(self.n_substeps):
                 self.m.substep(SCALE, THRESHOLD)
@@ -289,15 +339,53 @@ class Instrument:
         def k_g2p():
             m.G2P()
 
-        self._kernels = (k_clear, k_p2g, k_boundary, k_g2p)
+        # The damping kernel. Constants captured here, at build time.
+        kind = self.damping["kind"]
+        k_damp = None
+        if kind == DAMPING_KV:
+            # P2G's stencil is hardcoded 3x3x3 below; refuse if the vendored
+            # solver ever changes it rather than scatter with the wrong kernel.
+            if tuple(m.neighbour) != (3, 3, 3):
+                raise RuntimeError(f"mpm3d.neighbour is {m.neighbour}, expected (3, 3, 3)")
+            eta = self.damping["eta"]
+            # Same prefactor P2G applies to the elastic Kirchhoff stress
+            # (mpm3d.py:167), so the viscous term enters the grid momentum on
+            # exactly the footing the elastic one does.
+            pref = -m.dt * m.p_vol * 4.0 * m.inv_dx * m.inv_dx * eta
+
+            @ti.kernel
+            def k_damp():
+                for p in m.F_x:
+                    Xp = m.F_x[p] / m.dx
+                    base = int(Xp - 0.5)
+                    fx = Xp - base
+                    w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
+                    aff = pref * (m.F_C[p] + m.F_C[p].transpose())
+                    for offset in ti.static(ti.grouped(ti.ndrange(3, 3, 3))):
+                        dpos = (offset - fx) * m.dx
+                        weight = 1.0
+                        for i in ti.static(range(3)):
+                            weight *= w[offset[i]][i]
+                        m.F_grid_v[base + offset] += weight * (aff @ dpos)
+        elif kind == DAMPING_MASS:
+            factor = float(np.exp(-self.damping["alpha"] * self.substep_dt))
+
+            @ti.kernel
+            def k_damp():
+                for I in ti.grouped(m.F_grid_m):
+                    m.F_grid_v[I] *= factor
+
+        self._kernels = (k_clear, k_p2g, k_boundary, k_g2p, k_damp)
         return self._kernels
 
     def substep_split(self) -> None:
         """One substep through the split kernels. Must be bit-identical to
         mpm3d.substep(); --selftest check 1 is what establishes that."""
-        k_clear, k_p2g, k_boundary, k_g2p = self._build_kernels()
+        k_clear, k_p2g, k_boundary, k_g2p, k_damp = self._build_kernels()
         k_clear()
         k_p2g()
+        if k_damp is not None:
+            k_damp()          # grid still holds MOMENTUM here; Boundary divides by mass
         k_boundary()
         k_g2p()
 
@@ -307,7 +395,10 @@ class Instrument:
         Returns one record per substep. Expensive: two 4 MB grid readbacks per
         substep. Use on short runs only.
         """
-        k_clear, k_p2g, k_boundary, k_g2p = self._build_kernels()
+        k_clear, k_p2g, k_boundary, k_g2p, k_damp = self._build_kernels()
+        if k_damp is not None:
+            raise RuntimeError("advance_frame_probed() does not model damping; its "
+                               "loss_boundary term would absorb the damping sink")
         out = []
         for _ in range(n_frames):
             for _ in range(self.n_substeps):
