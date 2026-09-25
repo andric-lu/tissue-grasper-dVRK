@@ -3,10 +3,10 @@
 Learned dynamics models for soft tissue under robotic manipulation, starting with
 tissue retraction using the dVRK.
 
-**Start here: [`SETUP_GUIDE.md`](SETUP_GUIDE.md)** — a complete setup walkthrough
+**Start here: [`logs/SETUP_GUIDE.md`](logs/SETUP_GUIDE.md)** — a complete setup walkthrough
 assuming no command-line experience. Day-to-day commands are in
-[`CHEATSHEET.md`](CHEATSHEET.md). **Why anything is the way it is:
-[`DECISION_LOG.md`](DECISION_LOG.md)** — read this before changing a parameter.
+[`logs/CHEATSHEET.md`](logs/CHEATSHEET.md). **Why anything is the way it is:
+[`logs/DECISION_LOG.md`](logs/DECISION_LOG.md)** — read this before changing a parameter.
 
 ---
 
@@ -41,12 +41,14 @@ forcing a rewrite of the modelling code.
 
 | Path | Runs on | Contents |
 |---|---|---|
-| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema v2.0), `actions.py`, `materials.py`, `tissue_metrics.py`, `synthetic_traj.py` |
-| `host/` | macOS | `environment.yml`, `verify_host.py`, `train_dynamics.py`, `visualize_trajectory.py`, `validate_dataset.py` |
+| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema v2.1), `actions.py`, `materials.py`, `tissue_metrics.py`, `synthetic_traj.py`, `graph_design.py` (GNN node sampling / radius graphs) |
+| `host/` | macOS | `environment.yml`, `verify_host.py`, `train_dynamics.py`, `visualize_trajectory.py`, `validate_dataset.py`; MPM: `mpm_adapter.py`, `psm.py`, `grasp_constraint.py`, `visualize_grasp.py`, `smoke_test_{mpm,psm,grasp}.py` |
 | `container/` | Linux | `verify_container.py`, `make_tissue_mesh.py`, `collect_retraction.py`, `timestep_study.py`, `validate_physics.py` |
-| `tests/` | macOS | 200 unit tests over the `src/` layer |
+| `tests/` | macOS | 278 unit tests over the `src/` layer and the validator |
+| `third_party/`, `psm_Si_model/` | host | Vendored Taichi MPM solver and dVRK Si PSM model (see `PROVENANCE.md` in each) |
+| `logs/` | — | Setup guide, cheatsheet, decision log, session transcript |
 | `docker/` | — | `Dockerfile` |
-| `data/`, `data_synth/`, `models/` | **both** | Trajectories and checkpoints (git-ignored) |
+| `data/`, `data_synth/`, `data_mpm*/`, `models/` | **both** | Trajectories and checkpoints (git-ignored) |
 
 **What lives in `src/`** — everything both sides of the split must agree on. The
 trajectory schema, the action encoding, the material parameterisation, and the
@@ -57,7 +59,7 @@ trainer cannot quietly disagree about what a number means.
 
 ## Quick start
 
-Assuming setup is done (see `SETUP_GUIDE.md`):
+Assuming setup is done (see `logs/SETUP_GUIDE.md`):
 
 ```bash
 cd ~/tissue-dynamics
@@ -82,7 +84,7 @@ pytest tests/ -v
 ```
 
 Generate the analytic test episodes (needed by nothing else, useful for checking
-the metric/validator stack end to end — see `DECISION_LOG.md` §8.6):
+the metric/validator stack end to end — see `logs/DECISION_LOG.md` §8.6):
 
 ```bash
 python src/synthetic_traj.py --out data_synth/ --kinds all
@@ -110,7 +112,7 @@ already carries `tissue_faces` / `tissue_tets` for that purpose.
 
 **Open and blocking: timestep convergence.** `container/timestep_study.py` has
 never been run, `DT` is still 1/1000, and every episode in `data/` was collected
-at that unvalidated timestep. `DECISION_LOG.md` §4.
+at that unvalidated timestep. `logs/DECISION_LOG.md` §4.
 
 **Never run: `container/validate_physics.py`.** Nine controlled physics
 experiments, written 1 August, restored to the repository 17 August, still not

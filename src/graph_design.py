@@ -1,9 +1,10 @@
 """graph_design.py -- the arithmetic that chooses a graph before any model exists.
 
 numpy only, so it imports on both sides (CLAUDE.md, `src/` rule) and is unit
-tested without a Metal device. The Taichi and torch halves of Phase 0 live in
-host/ (mpm_locality_study.py, mps_scatter_check.py); everything here operates on
-arrays that have already left the solver.
+tested without a Metal device. The Taichi and torch halves of Phase 0
+(mpm_locality_study.py, mps_scatter_check.py) were removed in the September
+cleanup -- `git show a406612:host/<file>`; everything here operates on arrays
+that have already left the solver.
 
 WHY THIS FILE EXISTS
 --------------------

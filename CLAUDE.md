@@ -1,7 +1,7 @@
 # tissue-dynamics
 
 Learned dynamics models for soft tissue under robotic manipulation, starting with
-tissue retraction. Read `DECISION_LOG.md` before changing any parameter — it
+tissue retraction. Read `logs/DECISION_LOG.md` before changing any parameter — it
 records why each one is what it is. Section references below are to that file.
 
 ## Working with Andric
@@ -40,27 +40,27 @@ host-only — not a preference, the wheel does not exist (§9.3).
 ```bash
 # host
 conda activate tissue-host
-pytest tests/ -q                                    # 320 tests
+pytest tests/ -q                                    # 278 tests, 1 skipped
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
 python host/smoke_test_mpm.py                       # 16 checks, §9.4; ~10s first run
 python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
-python host/substep_study.py --frames 60            # §9.6; ~3 min, both materials
-python host/energy_audit.py --selftest              # §9.7 D1 gate, ~40s
-python host/energy_audit.py --frames 60             # §9.7; ~5 min, 3 cells
-python host/mps_scatter_check.py                    # §13.5; ~1 min, exit != 0 on FAIL
-python host/mpm_locality_study.py --selftest        # §13.2 gate, ~10 s
-python host/mpm_locality_study.py                   # §13.2; ~6 min, 30 rows; --replot redraws
-python host/locality_attribution.py                 # §13.2; ~30 s
-python host/mpm_adapter.py --task grasp --n-record 24000 --out data_mpm_full
-python host/coarsening_study.py --data data_mpm_full/   # §13.3; ~4 min; --replot redraws
-python host/graph_stats.py --n 450 600 900 --frames 1   # §13.4; seconds
+python host/mpm_adapter.py --task grasp --out data_mpm_grasp --episodes 2   # §10
+python host/smoke_test_psm.py                       # §10.4
+python host/smoke_test_grasp.py                     # §10.7
+python host/visualize_grasp.py data_mpm_grasp/mpm_0000.npz
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
 docker compose run --rm surrol python container/verify_container.py
 ```
+
+The research study scripts from §9.6–§13 (`substep_study`, `energy_audit`,
+`mpm_energy`, `mpm_locality_study`, `locality_attribution`, `coarsening_study`,
+`graph_stats`, `mps_scatter_check`, `src/energy_ledger.py`, `src/damping.py`)
+were removed in the September cleanup. Their findings below still stand; the
+code is recoverable with `git show a406612:<path>`.
 
 Run `validate_dataset.py` before training on any new data. It exists because a
 model cannot tell you its training data was wrong — it fits whatever it is given
@@ -115,8 +115,8 @@ Each of these cost real time. Do not quietly change one.
 
 ## Decision log discipline
 
-`DECISION_LOG.md` is the substantive record; `SESSION_TRANSCRIPT.md` is the
-chronological one. Both are in the repo and must stay there.
+`logs/DECISION_LOG.md` is the substantive record; `logs/SESSION_TRANSCRIPT.md` is
+the chronological one. Both are in the repo and must stay there.
 
 - **Write the log the same day.** §1–7 were written during the work; §8 was
   reconstructed sixteen days later from source, and the difference in effort was
@@ -368,7 +368,7 @@ Phase 0 changed about them. Before touching any of it:
   time it grows with substep count (`locality_attribution.py`). A GNN learns
   it anyway.
 - **Damping does not localise.** `Instrument.set_damping()` (Kelvin–Voigt or
-  mass, split path only; `none` still uses the vendored `substep()`) is kept
+  mass, in the removed `host/mpm_energy.py`; see a406612) is worth reviving
   for viscoelasticity, not locality.
 - **`compute_exposure` on any particle subset needs `weights=N/n`.** Coverage is
   a sum; 150 unweighted nodes read "clear" under full cover.
