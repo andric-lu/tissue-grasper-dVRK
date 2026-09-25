@@ -9,7 +9,7 @@ records why each one is what it is. Section references below are to that file.
 - **Not a computer science major.** Explain what a thing does and why it exists,
   not just what to type. Assume no familiarity with build systems, packaging, or
   git internals; assume real fluency in the physics and the research. He should be able to explain the CS decisions and implementations in precise detail.
-- **Show the reasoning trace.** He should be able to reproduce the work himself
+- **Concise but thorough explanations.** He should be able to reproduce the work himself
   afterwards. Name the commands you ran and what their output meant.
 - **Do not jump to the recommended implementation.** Give the alternatives and
   the tradeoff, then the recommendation. A decision he can't reconstruct in three
