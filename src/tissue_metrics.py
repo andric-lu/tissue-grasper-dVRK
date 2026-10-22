@@ -244,7 +244,8 @@ def compute_exposure(positions: np.ndarray, target_origin: np.ndarray,
                      threshold: float = DEFAULT_THRESHOLD,
                      grid: int = DEFAULT_GRID,
                      sharpness: float = DEFAULT_SHARPNESS,
-                     chunk: int = 64) -> np.ndarray:
+                     chunk: int = 64,
+                     weights: "np.ndarray | None" = None) -> np.ndarray:
     """Smooth fraction of the target region that tissue is not occluding.
 
     `positions` is (..., N, 3); the return is (...), each value in [0, 1].
@@ -265,9 +266,20 @@ def compute_exposure(positions: np.ndarray, target_origin: np.ndarray,
     and one 10 cm above it both occlude the line of sight equally. Particles on
     the far side are excluded entirely, which is what makes exposure increase
     when tissue is lifted clear rather than merely moved.
+
+    COVERAGE IS A SUM, SO IT DEPENDS ON HOW MANY PARTICLES CARRY THE BODY
+    (DECISION_LOG.md section 13.3). Each particle contributes a full unit
+    Gaussian, and `threshold` is an absolute level, so the same geometry sampled
+    by fewer particles reads as LESS covered. Under the full 24,000-particle slab
+    coverage is ~27; the same slab carried by 150 graph nodes sums to ~0.17, below
+    the 0.5 threshold, so every query point reads "clear" under complete cover.
+    `weights` (broadcastable to positions.shape[:-1], default all ones) scales
+    each particle's contribution: passing N_full / n for an n-node subset makes
+    a coarse representation stand for the mass it replaces. The default
+    reproduces the unweighted behaviour exactly.
     """
     cov, lead = _coverage(positions, target_origin, target_normal, target_extent,
-                          sigma=sigma, grid=grid, chunk=chunk)
+                          sigma=sigma, grid=grid, chunk=chunk, weights=weights)
     # sigmoid((threshold - coverage) / sharpness): ~1 well under threshold,
     # ~0 well over it. `sharpness` in units of coverage sets the width of the
     # transition and trades differentiability against fidelity to the hard count.
@@ -280,7 +292,8 @@ def hard_exposure(positions: np.ndarray, target_origin: np.ndarray,
                   sigma: float = DEFAULT_SIGMA,
                   threshold: float = DEFAULT_THRESHOLD,
                   grid: int = DEFAULT_GRID,
-                  chunk: int = 64) -> np.ndarray:
+                  chunk: int = 64,
+                  weights: "np.ndarray | None" = None) -> np.ndarray:
     """`compute_exposure` with a hard comparison instead of a sigmoid.
 
     For REPORTING. This is the number that means what it says -- "37 of 256
@@ -288,13 +301,14 @@ def hard_exposure(positions: np.ndarray, target_origin: np.ndarray,
     usable gradient, so it must not appear in a cost.
     """
     cov, lead = _coverage(positions, target_origin, target_normal, target_extent,
-                          sigma=sigma, grid=grid, chunk=chunk)
+                          sigma=sigma, grid=grid, chunk=chunk, weights=weights)
     return np.mean(cov < threshold, axis=-1).reshape(lead)
 
 
 def _coverage(positions: np.ndarray, target_origin: np.ndarray,
               target_normal: np.ndarray, target_extent: np.ndarray, *,
-              sigma: float, grid: int, chunk: int):
+              sigma: float, grid: int, chunk: int,
+              weights: "np.ndarray | None" = None):
     """Summed Gaussian occlusion at every query point. Shared by both exposures.
 
     Returns (coverage, leading_shape) where coverage is (B, grid*grid) with B
@@ -330,6 +344,18 @@ def _coverage(positions: np.ndarray, target_origin: np.ndarray,
     # far side of the target, which is total success rather than an error).
     B = int(np.prod(lead)) if lead else 1
     flat = pos.reshape(B, pos.shape[-2], 3)                  # (B, N, 3)
+    wflat = None
+    if weights is not None:
+        # WHY VALIDATED: a negative weight would make a particle UN-occlude, and a
+        # NaN would poison every query point it touches -- both silently.
+        wts = np.asarray(weights, np.float64)
+        if not np.all(np.isfinite(wts)) or np.any(wts < 0):
+            raise ValueError("weights must be finite and non-negative")
+        try:
+            wflat = np.broadcast_to(wts, pos.shape[:-1]).reshape(B, pos.shape[-2])
+        except ValueError:
+            raise ValueError(f"weights {wts.shape} do not broadcast to "
+                             f"positions.shape[:-1] = {pos.shape[:-1]}") from None
     n_q = q.shape[0]
     out = np.empty((B, n_q), np.float64)
 
@@ -349,6 +375,8 @@ def _coverage(positions: np.ndarray, target_origin: np.ndarray,
         proj = np.stack([rel @ e1, rel @ e2], axis=-1)       # (b, N, 2)
         d2 = np.sum((proj[:, None, :, :] - q[None, :, None, :]) ** 2, axis=-1)
         w = np.exp(-d2 * inv_two_sigma_sq) * side[:, None, :]
+        if wflat is not None:
+            w = w * wflat[lo:lo + max(1, chunk)][:, None, :]
         out[lo:lo + max(1, chunk)] = w.sum(axis=-1)          # (b, G*G)
     return out, lead
 

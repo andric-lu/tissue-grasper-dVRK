@@ -22,7 +22,6 @@ data_mpm_grasp/
 # and gif/mp4 renders are large.
 renders/
 models/*.pt
-runs/
 *.mp4
 
 # --- Python ------------------------------------------------------------------

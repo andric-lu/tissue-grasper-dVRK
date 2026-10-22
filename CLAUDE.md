@@ -1,7 +1,7 @@
 # tissue-dynamics
 
 Learned dynamics models for soft tissue under robotic manipulation, starting with
-tissue retraction. Read `DECISION_LOG.md` before changing any parameter — it
+tissue retraction. Read `logs/DECISION_LOG.md` before changing any parameter — it
 records why each one is what it is. Section references below are to that file.
 
 ## Working with Andric
@@ -9,7 +9,7 @@ records why each one is what it is. Section references below are to that file.
 - **Not a computer science major.** Explain what a thing does and why it exists,
   not just what to type. Assume no familiarity with build systems, packaging, or
   git internals; assume real fluency in the physics and the research. He should be able to explain the CS decisions and implementations in precise detail.
-- **Show the reasoning trace.** He should be able to reproduce the work himself
+- **Concise but thorough explanations.** He should be able to reproduce the work himself
   afterwards. Name the commands you ran and what their output meant.
 - **Do not jump to the recommended implementation.** Give the alternatives and
   the tradeoff, then the recommendation. A decision he can't reconstruct in three
@@ -40,20 +40,27 @@ host-only — not a preference, the wheel does not exist (§9.3).
 ```bash
 # host
 conda activate tissue-host
-pytest tests/ -q                                    # 279 tests
+pytest tests/ -q                                    # 278 tests, 1 skipped
 python host/validate_dataset.py --data data/        # exit != 0 on FAIL
 python host/visualize_trajectory.py data/x.npz      # --stride 3 for long episodes
 python src/synthetic_traj.py --out data_synth/ --kinds all
 python host/smoke_test_mpm.py                       # 16 checks, §9.4; ~10s first run
 python host/mpm_adapter.py --out data_mpm --episodes 2 --steps 100   # §9.5
-python host/substep_study.py --frames 60            # §9.6; ~3 min, both materials
-python host/energy_audit.py --selftest              # §9.7 D1 gate, ~40s
-python host/energy_audit.py --frames 60             # §9.7; ~5 min, 3 cells
+python host/mpm_adapter.py --task grasp --out data_mpm_grasp --episodes 2   # §10
+python host/smoke_test_psm.py                       # §10.4
+python host/smoke_test_grasp.py                     # §10.7
+python host/visualize_grasp.py data_mpm_grasp/mpm_0000.npz
 
 # container
 docker compose run --rm surrol python container/collect_retraction.py --episodes 20
 docker compose run --rm surrol python container/verify_container.py
 ```
+
+The research study scripts from §9.6–§13 (`substep_study`, `energy_audit`,
+`mpm_energy`, `mpm_locality_study`, `locality_attribution`, `coarsening_study`,
+`graph_stats`, `mps_scatter_check`, `src/energy_ledger.py`, `src/damping.py`)
+were removed in the September cleanup. Their findings below still stand; the
+code is recoverable with `git show a406612:<path>`.
 
 Run `validate_dataset.py` before training on any new data. It exists because a
 model cannot tell you its training data was wrong — it fits whatever it is given
@@ -108,8 +115,8 @@ Each of these cost real time. Do not quietly change one.
 
 ## Decision log discipline
 
-`DECISION_LOG.md` is the substantive record; `SESSION_TRANSCRIPT.md` is the
-chronological one. Both are in the repo and must stay there.
+`logs/DECISION_LOG.md` is the substantive record; `logs/SESSION_TRANSCRIPT.md` is
+the chronological one. Both are in the repo and must stay there.
 
 - **Write the log the same day.** §1–7 were written during the work; §8 was
   reconstructed sixteen days later from source, and the difference in effort was
@@ -342,6 +349,40 @@ established that you need to know:
   too many compounded rotated offsets to hand-derive reliably.
 - **Trocar-pivot (RCM-constrained) motion is not implemented.** IK is
   free-space 6-DOF; the URDF's `RCM` link is visual-only.
+
+### Phase 0 of the MPM→GNN brief — measured, nothing built (§13)
+
+Branch `phase0-measure`. Phases 1–6 are **not** implemented; §13.7 lists what
+Phase 0 changed about them. Before touching any of it:
+
+- **The MPM scene is 300×300×50 mm at 80 Hz with no clamp**, not the brief's
+  100×100×10 mm clamped sheet at 30 Hz. Grid dx 15.6 mm; the slab is 3.2 cells
+  thick.
+- **float32 drops volumetric strain increments below ulp(1)/(2·dt)** (7.9e-4
+  s⁻¹ at a 76 µs substep) and keeps shear. `1 + dt·C_ii` rounds to 1. More
+  substeps raise the floor. Any small-amplitude probe of this solver must
+  check linearity per distance band — an overall median hid this once.
+- **At rest, a control-run pair is identically zero.** Measure noise on the
+  perturbed pair.
+- **The solver's far-field coupling is partly numerical**: at fixed physical
+  time it grows with substep count (`locality_attribution.py`). A GNN learns
+  it anyway.
+- **Damping does not localise.** `Instrument.set_damping()` (Kelvin–Voigt or
+  mass, in the removed `host/mpm_energy.py`; see a406612) is worth reviving
+  for viscoelasticity, not locality.
+- **`compute_exposure` on any particle subset needs `weights=N/n`.** Coverage is
+  a sum; 150 unweighted nodes read "clear" under full cover.
+- **No node set up to 3,000 carries `safety_strain.max`** (best 0.84 of the
+  excess); 56% of the peak sits within one cell of the grasp. Open decision.
+- **Provisional numbers**: 600 surface-quota FPS nodes, R = 1.7h ≈ 32 mm,
+  record at 1/240 s, M = 10, no damping. At 1/80 s the same graph needs M ≥ 14.
+- **`p_vol` assumes 8 particles per cell; the cloud has 20.3**, so mass, force
+  and absolute energy are 2.54× the geometric body. Not fixed.
+- **MPS scatter-add is correct; batched inference is 0.05% of the MPPI budget.**
+  The brief's "230,000 node updates/s" is forward passes; the real unit is
+  S·H·f·E·M edge-block evaluations.
+- **Hand-picked float tolerances failed twice this session.** Score against a
+  float64 reference relative to CPU float32 instead.
 
 Material ranges in `materials.py` are still placeholders, so no result should be
 claimed from a model trained on this data yet.
