@@ -1,0 +1,72 @@
+{
+  "_comment": "Item 6 debug set on the Classic x5 arm: the classic pilot plus modest per-episode variation -- grasp point +/-2 cm in x, y; retraction within a 20 degree cone of vertical; 1-3 cm at the nominal 4 cm/s. Material drawn from each episode's seed; each concrete draw is saved as mpm_XXXX.config.json. Bite depth 8 mm and 0.5 s close per DECISION_LOG 14.18. Grasp applied as a grid boundary condition (grasp_model grid_bc, DECISION_LOG 14.22), not the 10.7 teleport.",
+  "frame_dt_s": 0.004166666666666667,
+  "arm": {
+    "model": "classic",
+    "scaling": 5.0,
+    "rcm_position_m": [
+      0.25,
+      0.35,
+      0.6
+    ]
+  },
+  "orientation_xyzw": [
+    -0.7071067811865476,
+    -0.7071067811865476,
+    0.0,
+    0.0
+  ],
+  "grasp_position_m": [
+    0.25,
+    0.35,
+    0.1385
+  ],
+  "approach": {
+    "direction_from_grasp": [
+      0,
+      0,
+      1
+    ],
+    "distance_m": 0.04,
+    "duration_s": 0.4
+  },
+  "jaw": {
+    "open_rad": 1.3962634015954636,
+    "closed_rad": 0.0
+  },
+  "retract": {
+    "direction": [
+      0,
+      0,
+      1
+    ],
+    "distance_m": 0.02,
+    "duration_s": 0.5
+  },
+  "preroll_s": 1.0,
+  "close": {
+    "duration_s": 0.5
+  },
+  "hold": {
+    "duration_s": 0.1
+  },
+  "release": {
+    "duration_s": 0.125
+  },
+  "post_release": {
+    "duration_s": 0.25
+  },
+  "randomize": {
+    "grasp_offset_xy_m": [
+      -0.02,
+      0.02
+    ],
+    "retract_cone_deg": 20.0,
+    "retract_distance_m": [
+      0.01,
+      0.03
+    ],
+    "material": "sample"
+  },
+  "grasp_model": "grid_bc"
+}

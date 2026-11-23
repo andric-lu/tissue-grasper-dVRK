@@ -72,6 +72,7 @@ is the point of having a format.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -86,7 +87,9 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 sys.path.insert(0, os.path.join(REPO, "host"))           # so `import psm` works
 
 import actions                                            # noqa: E402
+import collection_config                                 # noqa: E402
 import materials                                         # noqa: E402
+import tool_geometry                                     # noqa: E402
 import tissue_metrics                                    # noqa: E402
 import trajectory_io                                     # noqa: E402
 import psm                                                # noqa: E402 -- imports
@@ -136,6 +139,7 @@ class MPMRecorder:
         substep_safety: float = 0.3,
         n_substeps: Optional[int] = None,
         notes: str = "",
+        particle_ids: Optional[np.ndarray] = None,
     ):
         import MPM.mpm3d as mpm3d          # imports run ti.init() -- see 9.4
         import taichi as ti
@@ -274,23 +278,54 @@ class MPMRecorder:
         self.backend = backend
 
         n_sim = int(self.m.n_particles)
-        if n_record > n_sim:
-            raise ValueError(f"n_record={n_record} exceeds the solver's {n_sim} "
-                             "particles; a subset cannot be larger than its set")
         self.n_sim = n_sim
-        self.n_record = int(n_record)
 
-        # THE SUBSET, CHOSEN ONCE. Sorted so particle_ids is monotonic, which
-        # makes "are these unique" answerable by inspection and keeps the stored
-        # nodes in a stable, reproducible order across episodes with the same
-        # seed. Uniform without replacement: MPM particle index carries no
-        # spatial structure (init_cube assigns random positions per index), so
-        # a uniform draw is already spatially uniform.
-        rng = np.random.default_rng(seed)
-        self.particle_ids = np.sort(
-            rng.choice(n_sim, size=self.n_record, replace=False)).astype(np.int32)
+        if particle_ids is not None:
+            # A FIXED NODE SET, chosen once from the reference cloud and shared
+            # by every episode (TODO_ASSESSMENT section 4.4). Without it each
+            # seed draws a different subset, so node i is a different particle
+            # in every episode: the MLP cannot learn across episodes at all and
+            # a graph model's per-node errors cannot be compared between them.
+            ids = np.asarray(particle_ids, np.int64).ravel()
+            if ids.size == 0 or ids.min() < 0 or ids.max() >= n_sim:
+                raise ValueError(f"particle_ids must index [0, {n_sim})")
+            if np.unique(ids).size != ids.size:
+                raise ValueError("particle_ids contains duplicates")
+            self.particle_ids = np.sort(ids).astype(np.int32)
+            self.n_record = int(self.particle_ids.size)
+        else:
+            if n_record > n_sim:
+                raise ValueError(f"n_record={n_record} exceeds the solver's {n_sim} "
+                                 "particles; a subset cannot be larger than its set")
+            self.n_record = int(n_record)
+            # THE SUBSET, CHOSEN ONCE PER EPISODE. Sorted so particle_ids is
+            # monotonic. Uniform without replacement: MPM particle index
+            # carries no spatial structure (init_cube assigns random positions
+            # per index), so a uniform draw is already spatially uniform.
+            # NOTE: varies with `seed`, so node identity differs between
+            # episodes -- pass `particle_ids` for a dataset.
+            rng = np.random.default_rng(seed)
+            self.particle_ids = np.sort(
+                rng.choice(n_sim, size=self.n_record, replace=False)).astype(np.int32)
 
         self._init_solver()
+
+        # THE REFERENCE CONFIGURATION, READ BEFORE THE FIRST SUBSTEP. init_cube()
+        # sets F = I for every particle, so the positions it lays out ARE the
+        # undeformed reference X of the to-do's node features -- by the
+        # solver's own definition of F, not by assumption. Read now, because
+        # one substep later the cloud has started to fall and F != I.
+        # WHY ASSERT F = I: if a future init path starts from a pre-strained
+        # state, "spawn positions" would stop being the reference, and x - X
+        # would silently measure displacement from the wrong configuration.
+        rest_full, _, F0 = self.state()
+        dev = float(np.abs(F0 - np.eye(3, dtype=F0.dtype)).max())
+        if dev > 1e-6:
+            raise RuntimeError(f"F is not identity at initialisation (max |F-I| "
+                               f"{dev:.3g}); spawn positions are not the reference "
+                               "configuration")
+        self.rest_pos_simulated = rest_full.astype(np.float32)
+        self.preroll_s = 0.0
 
         # Default target: a small patch directly above the tissue, facing up.
         # Arbitrary but explicit -- exposure is meaningless without one, and a
@@ -364,6 +399,18 @@ class MPMRecorder:
             f_encoding=f_encoding,
             particle_ids=self.particle_ids,
             n_particles_simulated=n_sim,
+            # -- schema 3.0 --
+            rest_pos=self.rest_pos_simulated[self.particle_ids],
+            rest_pos_simulated=self.rest_pos_simulated,
+            # Homogeneous tissue: the episode material broadcast to every node
+            # (to-do Item 5). Natural logs of Pascals, density in kg/m^3.
+            material_field=np.tile(np.array(
+                [np.log(self.mu), np.log(self.lam), self.rho], np.float32),
+                (self.n_record, 1)),
+            # One action per recorded frame: the control interval IS the
+            # recording interval in this collector.
+            control_dt=self.frame_dt,
+            preroll_s=0.0,
         )
         self.n_steps = 0
         self._closed = False
@@ -405,6 +452,26 @@ class MPMRecorder:
         self.ti.sync()
 
     # -- driving -----------------------------------------------------------
+    def preroll(self, seconds: float, **advance_kwargs) -> int:
+        """Simulate `seconds` BEFORE row 0, without recording (settle pre-roll).
+
+        WHY: the tissue spawns in the air. In the 80 Hz grasp script the
+        approach overlapped the gravity drop, so the tool met tissue that was
+        still falling -- not the settled tissue the to-do's grasp sequence
+        assumes (TODO_ASSESSMENT 4.3). Rounded to whole frames; the duration
+        actually simulated is what gets recorded as `preroll_s`, so row 0's
+        state is honestly labelled as NOT the reference configuration.
+        """
+        if self.n_steps:
+            raise RuntimeError("preroll() after capture(): the pre-roll must "
+                               "come before row 0")
+        k = int(round(float(seconds) / self.frame_dt))
+        if k:
+            self.advance(k, **advance_kwargs)
+        self.preroll_s += k * self.frame_dt
+        self.w.set_static(preroll_s=self.preroll_s)
+        return k
+
     def advance(self, n_frames: int = 1, scale: float = 1.0,
                 threshold: float = 0.05,
                 grasp: Optional["grasp_constraint.GraspConstraint"] = None,
@@ -443,7 +510,16 @@ class MPMRecorder:
             if robot is not None:
                 robot.update_collision_geometry(self.m, self.m.sdf)
                 robot.update_collision_velocity(self.m, self.frame_dt)
+            # A grid-BC grasp (host/grasp_grid_bc.py, DECISION_LOG 14.22) owns
+            # the whole substep: it runs the vendored P2G/Boundary/G2P itself
+            # with its boundary condition inside. The teleport grasp runs after
+            # the vendored substep, as before.
+            own = getattr(grasp, "substep", None)
             for i in range(self.n_substeps):
+                if own is not None:
+                    own(scale, threshold, pose_start, pose_end, self.frame_dt,
+                        i / self.n_substeps)
+                    continue
                 self.m.substep(scale, threshold)
                 if grasp is not None:
                     grasp.apply(pose_start, pose_end, self.frame_dt,
@@ -460,8 +536,14 @@ class MPMRecorder:
                 grasp_active: bool = False,
                 grasp_node_ids: Optional[Sequence[int]] = None,
                 contact_mode: Optional[int] = None,
-                contact_force: Optional[np.ndarray] = None) -> dict:
-        """Record one step. Returns the metrics, computed over every particle."""
+                contact_force: Optional[np.ndarray] = None,
+                **v3_fields) -> dict:
+        """Record one step. Returns the metrics, computed over every particle.
+
+        `v3_fields` passes schema-3.0 per-step fields (jaw_box_pose, node_grasp,
+        phase, ...) straight to TrajectoryWriter.append(). `time` is supplied
+        here, from the row count, so it cannot disagree with dt.
+        """
         pos, vel, F = self.state()
 
         # RULE 2: metrics over ALL particles, before any subsampling. A maximum
@@ -469,8 +551,15 @@ class MPMRecorder:
         t_o, t_n, t_e = self.target
         exposure = float(tissue_metrics.compute_exposure(
             pos.astype(np.float64), t_o, t_n, t_e))
-        strain = tissue_metrics.compute_safety_strain(F.astype(np.float64))
+        F64 = F.astype(np.float64)
+        strain = tissue_metrics.compute_safety_strain(F64)
         safety = float(strain["max"])
+        # WHICH particle carried the peak, and where (DECISION_LOG 14.20).
+        # Without it, a subset file cannot say whether its logged maximum was
+        # recordable at all, and the validator's subset corroboration had to
+        # fall back on a margin tuned on settling. Taken from the same stretch
+        # array as the max (a second SVD pass would cost ~39 ms per row).
+        peak = int(strain["argmax"])
 
         idx = self.particle_ids
         self.w.append(
@@ -491,6 +580,10 @@ class MPMRecorder:
             contact_force=contact_force,
             exposure=exposure,
             safety_strain=safety,
+            safety_strain_id=peak,
+            safety_strain_pos=pos[peak],
+            time=self.n_steps * self.frame_dt,
+            **v3_fields,
         )
         self.n_steps += 1
         return {"exposure": exposure, "safety_strain": safety,
@@ -510,11 +603,21 @@ class MPMRecorder:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # Write even if the episode raised: a partial trajectory is usually
-        # still worth inspecting, and losing a long run to an exception in the
-        # last step is infuriating. Mirrors TrajectoryWriter.__exit__.
-        if self.n_steps and not self._closed:
-            self.close()
+        # A CRASHED EPISODE IS SAVED AS `<path>.partial`, NEVER AS `<path>`.
+        # This used to call close() on any exit, so an episode that raised at
+        # row 40 of 200 was written as a normal-looking file with 40 rows --
+        # and the validator's comparability check compares node count, action
+        # width and dt, none of which a truncation changes. The rows are kept
+        # for inspection under a name list_trajectories() never matches.
+        if not self._closed:
+            if exc_type is not None:
+                partial = self.w.abort(f"{exc_type.__name__}: {exc}")
+                if partial:
+                    print(f"episode raised after {self.n_steps} row(s); kept as "
+                          f"{partial} (not a dataset file)")
+                self._closed = True
+            elif self.n_steps:
+                self.close()
         return False  # never swallow the exception
 
 
@@ -534,7 +637,9 @@ def sample_episode_material(seed: int):
 
 def record_episode(path: str, *, n_steps: int = 100, seed: int = 0,
                    n_record: int = DEFAULT_N_RECORD, quiet: bool = False,
-                   material=None, n_substeps: Optional[int] = None) -> str:
+                   material=None, n_substeps: Optional[int] = None,
+                   frame_dt: float = 0.0125, f_encoding: str = "delta16",
+                   particle_ids: Optional[np.ndarray] = None) -> str:
     """One passive episode: tissue released under gravity, no tool.
 
     Passive because there is no robot yet (see the module docstring). It still
@@ -552,14 +657,18 @@ def record_episode(path: str, *, n_steps: int = 100, seed: int = 0,
 
     t0 = time.time()
     with MPMRecorder(path, task="tissue_settle", mu=mu, lam=lam, rho=rho,
-                     n_record=n_record, seed=seed,
-                     n_substeps=n_substeps) as rec:
+                     n_record=n_record, seed=seed, n_substeps=n_substeps,
+                     frame_dt=frame_dt, f_encoding=f_encoding,
+                     particle_ids=particle_ids) as rec:
         # A zero delta-pose action is a real action ("hold still"), not a
         # placeholder, so action_spec="delta_pose_jaw" is honest here.
         ee_pose = np.array([0.25, 0.35, 0.20, 0, 0, 0, 1], np.float32)
         action = np.zeros(7, np.float32)
+        # No pre-roll: row 0 is the spawn state, F = I, the reference
+        # configuration itself (preroll_s = 0 says so in the file).
         for t in range(n_steps):
-            rec.capture(ee_pose=ee_pose, action=action)
+            rec.capture(ee_pose=ee_pose, action=action,
+                        phase=collection_config.PHASE_ID["settle"])
             rec.advance(1)
         out = rec.close()
         n_rec, n_sim = rec.n_record, rec.n_sim
@@ -594,53 +703,28 @@ JAW_OPEN_RAD = 1.0
 JAW_CLOSED_RAD = 0.0
 
 
-def _scripted_waypoints(n_approach: int, n_close: int, n_retract: int,
-                        n_release: int = 0):
-    """approach -> close -> retract -> [release]. No planner -- a single
-    hardcoded demonstration path. Fixed orientation throughout, picked by
-    reading a real FK point rather than deriving one: at
-    base=psm.DEFAULT_BASE_POSITION/ORIENTATION, j1=0, sweeping
-    outer_insertion from 0 to 0.14 moves tool_gripper_center from a hover
-    point ~0.14 m above the tissue to just above its top surface without
-    changing orientation (verified directly against the live URDF before
-    this was written).
+def legacy_grasp_config(n_approach: int = 20, n_close: int = 10,
+                        n_retract: int = 20, n_release: int = 0,
+                        frame_dt: float = 0.0125) -> dict:
+    """The section 10 script as a config: FRAME counts at 80 Hz, no pre-roll.
 
-    n_release defaults to 0 (existing callers/CLI defaults unaffected): the
-    original 3-phase script never reopens the jaw, so a real GraspConstraint
-    release is never exercised without this 4th phase. When n_release>0, the
-    EE is held FIXED at the retract endpoint (`hover`) while the jaw
-    interpolates JAW_CLOSED_RAD -> JAW_OPEN_RAD -- holding position fixed
-    isolates the release event, so a test can assert release causes the
-    grasp_active transition, not motion.
-
-    Returns (poses, jaws): poses is
-    ((n_approach+n_close+n_retract+n_release+1), 7) float64, jaws is (same
-    length,) float64. poses[t]/jaws[t] is the state BEFORE step t's action is
-    applied -- poses[0] is the starting state.
+    Kept so host/smoke_test_grasp.py and host/smoke_test_psm.py, which call
+    record_grasp_episode(n_approach=..., ...), drive exactly the episode they
+    were verified against. collection_config.DEFAULT_GRASP_CONFIG has the same
+    geometry; this only pins the frame counts and the 80 Hz interval.
+    tests/test_collection_config.py checks the two produce identical waypoints.
     """
-    quat = np.array([0.7048, -0.7048, -0.0576, 0.0576])
-    hover = np.array([0.274, 0.35, 0.226])
-    grasp_pos = np.array([0.252, 0.35, 0.088])
-
-    poses = [np.concatenate([hover, quat])]
-    jaws = [JAW_OPEN_RAD]
-    for i in range(1, n_approach + 1):
-        t = i / n_approach
-        poses.append(np.concatenate([hover * (1 - t) + grasp_pos * t, quat]))
-        jaws.append(JAW_OPEN_RAD)
-    for i in range(1, n_close + 1):
-        t = i / n_close
-        poses.append(np.concatenate([grasp_pos, quat]))
-        jaws.append(JAW_OPEN_RAD * (1 - t) + JAW_CLOSED_RAD * t)
-    for i in range(1, n_retract + 1):
-        t = i / n_retract
-        poses.append(np.concatenate([grasp_pos * (1 - t) + hover * t, quat]))
-        jaws.append(JAW_CLOSED_RAD)
-    for i in range(1, n_release + 1):
-        t = i / n_release
-        poses.append(np.concatenate([hover, quat]))   # EE fixed -- isolates release
-        jaws.append(JAW_CLOSED_RAD * (1 - t) + JAW_OPEN_RAD * t)
-    return np.array(poses, np.float64), np.array(jaws, np.float64)
+    cfg = collection_config.load_config(None)
+    cfg["frame_dt_s"] = frame_dt
+    cfg["preroll_s"] = 0.0
+    cfg["approach"]["duration_s"] = n_approach * frame_dt
+    cfg["close"]["duration_s"] = n_close * frame_dt
+    cfg["hold"]["duration_s"] = 0.0
+    cfg["retract"]["duration_s"] = n_retract * frame_dt
+    cfg["release"]["duration_s"] = n_release * frame_dt
+    cfg["post_release"]["duration_s"] = 0.0
+    collection_config.validate_config(cfg)
+    return cfg
 
 
 def _contact_mode(rec: "MPMRecorder", robot: "psm.PSM",
@@ -672,7 +756,7 @@ def _contact_mode(rec: "MPMRecorder", robot: "psm.PSM",
     pos = pos_full.astype(np.float64)   # ALL simulated particles, not the recorded subset
     poses = robot.jaw_box_poses()
     d_min = np.inf
-    for link_name in psm.JAW_LINKS:
+    for link_name in robot.jaw_links:
         box_pos, box_quat = poses[link_name]
         half_extents = robot.jaw_half_extents(link_name)
         local = (pos - box_pos) @ psm.rotmat_from_quat(box_quat)
@@ -685,65 +769,122 @@ def _contact_mode(rec: "MPMRecorder", robot: "psm.PSM",
     return trajectory_io.CONTACT_NONE
 
 
-def record_grasp_episode(path: str, *, n_steps: int = 50, seed: int = 0,
-                          n_record: int = DEFAULT_N_RECORD, quiet: bool = False,
-                          n_approach: int = 20, n_close: int = 10,
-                          n_retract: int = 20, n_release: int = 0) -> str:
-    """A scripted approach -> close -> retract -> [release] episode, driven
-    by the dVRK Si PSM (host/psm.py) with a real persistent grasp
-    (host/grasp_constraint.py). CONTACT_GRASP/grasp_active/grasp_node_ids are
-    real once a freeze fires -- see grasp_constraint.GraspConstraint and
-    _contact_mode()'s docstring; before any freeze (or if n_release=0 and the
-    geometry never selects a nonempty set), they read the same honest
-    NONE/TOUCH/STICK/False/[] as before.
+def make_robot(cfg: dict, rec: "MPMRecorder"):
+    """The arm the config names (DECISION_LOG 14.15).
+
+    "si"       host/psm.py's Si PSM, life-size, our own IK (the section 10 arm)
+    "classic"  SurRoL's Psm1 (dVRK Classic) via host/psm_classic.py, at the
+               config's `scaling` with its RCM at `rcm_position_m`. Imported
+               here, not at module level, because it needs SurRoL, which only
+               the tissue-sim environment has.
+    """
+    arm = cfg.get("arm") or {"model": "si"}
+    if arm["model"] == "classic":
+        import psm_classic
+        return psm_classic.ClassicPSM(rec.m, rec.m.sdf,
+                                      rcm_position=tuple(arm["rcm_position_m"]),
+                                      scaling=float(arm.get("scaling", 5.0)))
+    if float(arm.get("scaling", 1.0)) != 1.0:
+        raise ValueError("the Si arm (host/psm.py) has no scaling option")
+    return psm.PSM(rec.m, rec.m.sdf, base_position=psm.DEFAULT_BASE_POSITION,
+                   base_orientation=psm.DEFAULT_BASE_ORIENTATION)
+
+
+def record_grasp_episode(path: str, *, n_steps: Optional[int] = None,
+                          seed: int = 0, n_record: int = DEFAULT_N_RECORD,
+                          quiet: bool = False, n_approach: Optional[int] = None,
+                          n_close: Optional[int] = None,
+                          n_retract: Optional[int] = None, n_release: int = 0,
+                          config: Optional[dict] = None,
+                          f_encoding: str = "delta16",
+                          particle_ids: Optional[np.ndarray] = None) -> str:
+    """A scripted approach -> close -> [hold] -> retract -> [release] episode,
+    driven by the dVRK Si PSM (host/psm.py) with a real persistent grasp
+    (host/grasp_constraint.py).
+
+    TWO WAYS TO CALL IT.
+      config=<dict>    the schema-3.0 path. Every motion parameter, the
+                       recording interval and the settle pre-roll come from
+                       a collection_config dict in physical units.
+      n_approach=...   the section 10 path (frame counts at 80 Hz, no
+                       pre-roll), kept for the smoke tests -- see
+                       legacy_grasp_config(). Used when `config` is None.
 
     STATE/ACTION TIMING CONTRACT. Row t's ee_pose/jaw are the
     commanded/analytic scripted waypoint values, NOT the IK-achieved pose --
     this is what makes "applying row t's action reproduces row t+1's
     recorded state" exact rather than approximate (checked in
-    host/smoke_test_psm.py), and avoids conflating two different "the pose"
-    values the way this adapter's own history warns against (two numbers
-    that agree with everything except each other -- see DECISION_LOG.md's
-    account of the timebase bug this project already hit once). IK-achieved
-    accuracy is validated separately, inside psm.PSM.set_ee_pose() itself,
+    host/smoke_test_psm.py and by validate_dataset's action-indexing check).
+    IK-achieved accuracy is validated separately, inside psm.PSM.set_ee_pose(),
     which raises if achieved pose drifts from commanded beyond tolerance.
-    joint_pos is the ACHIEVED joint state (a genuinely different, useful
-    quantity: how far IK residual pushed the real configuration). The same
-    commanded pose (poses[t]) is what GraspConstraint.maybe_freeze() uses to
-    capture r_p, for the same reason.
+    joint_pos and the v3 jaw_box_pose are ACHIEVED quantities (FK of the IK
+    solution). The commanded pose (poses[t]) is what
+    GraspConstraint.maybe_freeze() uses to capture r_p, for the same reason.
 
     Collision geometry uses the END-of-frame transform: the PSM is driven to
-    the frame's target pose BEFORE advance() is called, so
-    advance()'s once-per-frame update_collision_geometry() reads that just-set
-    new pose and holds it constant across the frame's substeps; collision
-    velocity is the backward difference bracketing that same frame. The
-    grasp constraint's own enforcement, by contrast, runs once per SUBSTEP
-    with the frame's start/end poses interpolated -- see
-    grasp_constraint.GraspConstraint.apply()'s docstring for why that's
-    needed here and not for collision geometry.
+    the frame's target pose BEFORE advance() is called, so advance()'s
+    once-per-frame update_collision_geometry() reads that just-set new pose
+    and holds it constant across the frame's substeps; collision velocity is
+    the backward difference bracketing that same frame. The grasp
+    constraint's own enforcement runs once per SUBSTEP with the frame's
+    start/end poses interpolated -- see GraspConstraint.apply().
 
-    RECORDS T = n_steps + 1 ROWS, not n_steps. n_steps real actions are
-    simulated from n_steps+1 waypoints; the final waypoint's resulting state
-    (poses[n_steps]) is captured as its own row with a zero-padded action,
-    matching src/actions.py's absolute_to_delta_actions() documented
-    convention for a trajectory's final row.
+    RECORDS T = transitions + 1 ROWS. The final waypoint's resulting state is
+    captured as its own row with a zero-padded action (the to-do's T+1
+    states / T actions convention, plus one pad row; docs/FIELD_DICTIONARY.md).
+
+    SCHEMA 3.0 PER-ROW FIELDS (see tool_geometry.py for the rules):
+      jaw_box_pose   achieved world pose of each jaw collision box
+      jaw_box_vel    backward difference of jaw_box_pose (row 0 zero)
+      jaw_joint      [jaw, -jaw]: jaw_joint_1 and its mimic jaw_joint_2
+      node_contact   node within contact_radius of a jaw box
+      node_grasp     node-level two-jaw latch, evaluated on the RECORDED nodes
+      grasp_full_ids the solver's true full-resolution attached particles
+      phase          collection_config.PHASES index
     """
-    mu, lam, rho = sample_episode_material(seed)
-    poses, jaws = _scripted_waypoints(n_approach, n_close, n_retract, n_release)
-    n_total = n_approach + n_close + n_retract + n_release
-    if n_steps != n_total:
-        raise ValueError(
-            f"n_steps={n_steps} must equal "
-            f"n_approach+n_close+n_retract+n_release={n_total}")
+    if config is None:
+        cfg = legacy_grasp_config(
+            20 if n_approach is None else n_approach,
+            10 if n_close is None else n_close,
+            20 if n_retract is None else n_retract, n_release)
+    else:
+        if any(v is not None for v in (n_approach, n_close, n_retract)) or n_release:
+            raise ValueError("pass either config= or the legacy n_* frame counts, not both")
+        cfg = config
+    wp = collection_config.build_waypoints(cfg)
+    poses, jaws, phases = wp["poses"], wp["jaw"], wp["phase"]
+    n_trans = len(poses) - 1
+    if n_steps is not None and n_steps != n_trans:
+        raise ValueError(f"n_steps={n_steps} but the scripted trajectory has "
+                         f"{n_trans} transitions")
+    frame_dt = float(cfg["frame_dt_s"])
 
+    mu, lam, rho = sample_episode_material(seed)
     t0 = time.time()
     with MPMRecorder(path, task="tissue_grasp", mu=mu, lam=lam, rho=rho,
-                      n_record=n_record, seed=seed) as rec:
-        robot = psm.PSM(rec.m, rec.m.sdf,
-                         base_position=psm.DEFAULT_BASE_POSITION,
-                         base_orientation=psm.DEFAULT_BASE_ORIENTATION)
+                     n_record=n_record, seed=seed, frame_dt=frame_dt,
+                     f_encoding=f_encoding, particle_ids=particle_ids) as rec:
+        robot = make_robot(cfg, rec)
         rec.robot = robot
-        grasp = grasp_constraint.GraspConstraint(rec.m, rec.ti)
+        grasp_model = cfg.get("grasp_model", "teleport")
+        if grasp_model == "grid_bc":
+            import grasp_grid_bc
+            grasp = grasp_grid_bc.GridGraspConstraint(rec.m, rec.ti)
+        elif grasp_model == "teleport":
+            grasp = grasp_constraint.GraspConstraint(rec.m, rec.ti)
+        else:
+            raise ValueError(f"grasp_model must be 'teleport' or 'grid_bc', got {grasp_model!r}")
+        half = np.stack([robot.jaw_half_extents(n) for n in robot.jaw_links]
+                        ).astype(np.float32).astype(np.float64)   # as stored
+        rec.w.set_static(
+            jaw_names=list(robot.jaw_links),
+            robot_model=robot.model_name,
+            robot_scale=robot.scaling,
+            jaw_half_extents=half,
+            jaw_box_offset=np.stack([robot.jaw_box_offset(n) for n in robot.jaw_links]),
+            grasp_capture_radius=tool_geometry.GRASP_CAPTURE_RADIUS_M,
+            jaw_release_rad=tool_geometry.JAW_RELEASE_TRIGGER_RAD,
+            contact_radius=tool_geometry.CONTACT_RADIUS_M)
         try:
             robot.set_ee_pose(poses[0], jaws[0])
             robot.update_collision_geometry(rec.m, rec.m.sdf)
@@ -755,11 +896,39 @@ def record_grasp_episode(path: str, *, n_steps: int = 50, seed: int = 0,
             # call. This is where "before the episode starts" belongs.
             robot.update_collision_velocity(rec.m, rec.frame_dt)
 
+            # SETTLE PRE-ROLL: the arm holds its start pose (well above the
+            # tissue) while the tissue falls and settles. advance() refreshes
+            # collision geometry each frame against the unchanged pose, so the
+            # jaw velocity stays exactly zero throughout.
+            rec.preroll(float(cfg["preroll_s"]),
+                        threshold=GRASP_CONTACT_THRESHOLD_M)
+
+            state = {"latched": np.zeros(rec.n_record, bool), "prev_box": None}
+
             def _capture_row(t: int) -> None:
                 grasp.maybe_freeze(rec, robot, pose_t=poses[t], jaw_angle=float(jaws[t]))
                 grasp.maybe_release(jaw_angle=float(jaws[t]))
                 action_t = (actions.encode_action(poses[t], poses[t + 1], jaws[t + 1])
-                           if t < n_steps else np.zeros(7, np.float64))
+                            if t < n_trans else np.zeros(7, np.float64))
+
+                box = robot.jaw_box_poses()
+                # Rounded through float32 BEFORE the node flags use it, because
+                # float32 is what the file stores. The validator re-derives
+                # node_contact/node_grasp from the file and demands an exact
+                # match; computing them from float64 poses would let a node
+                # sitting within 1e-8 m of a radius flip between the two.
+                box_pose = np.stack([np.concatenate(box[n]) for n in robot.jaw_links]
+                                    ).astype(np.float32).astype(np.float64)
+                if state["prev_box"] is None:
+                    box_vel = np.zeros((len(robot.jaw_links), 6))
+                else:
+                    box_vel = tool_geometry.box_velocity_backward(
+                        np.stack([state["prev_box"], box_pose]), rec.frame_dt)[1]
+                state["prev_box"] = box_pose
+
+                node_pos = rec.state()[0][rec.particle_ids].astype(np.float64)
+                state["latched"] = tool_geometry.grasp_latch_step(
+                    state["latched"], node_pos, box_pose, half, float(jaws[t]))
                 rec.capture(
                     ee_pose=poses[t].astype(np.float32),
                     action=action_t.astype(np.float32),
@@ -768,20 +937,25 @@ def record_grasp_episode(path: str, *, n_steps: int = 50, seed: int = 0,
                     contact_mode=_contact_mode(rec, robot, grasp=grasp),
                     grasp_active=grasp.is_active(),
                     grasp_node_ids=grasp.recorded_node_ids(rec.particle_ids),
+                    jaw_box_pose=box_pose,
+                    jaw_box_vel=box_vel,
+                    jaw_joint=robot.jaw_joint_values(float(jaws[t])),
+                    node_contact=tool_geometry.node_contact_flags(node_pos, box_pose, half),
+                    node_grasp=state["latched"],
+                    grasp_full_ids=grasp.full_ids(),
+                    phase=int(phases[t]),
                 )
 
-            for t in range(n_steps):
+            for t in range(n_trans):
                 _capture_row(t)
                 robot.set_ee_pose(poses[t + 1], jaws[t + 1])
                 rec.advance(1, threshold=GRASP_CONTACT_THRESHOLD_M,
-                           grasp=grasp, pose_start=poses[t], pose_end=poses[t + 1])
+                            grasp=grasp, pose_start=poses[t], pose_end=poses[t + 1])
 
-            # The missing final row: poses[n_steps] was simulated (by the
-            # last advance() call above) but never captured as its own row.
-            # Zero-padded action -- there is no poses[n_steps+1] to encode a
-            # transition to. Grasp state is re-checked here too, not
-            # special-cased away.
-            _capture_row(n_steps)
+            # The final row: poses[n_trans] was simulated by the last advance()
+            # but not yet captured. Zero-padded action -- there is no
+            # poses[n_trans + 1] to encode a transition to.
+            _capture_row(n_trans)
         finally:
             robot.close()
         out = rec.close()
@@ -791,8 +965,11 @@ def record_grasp_episode(path: str, *, n_steps: int = 50, seed: int = 0,
     if not quiet:
         E, nu = materials.E_nu_from_lame(mu, lam)
         size = os.path.getsize(out) / 1e6
-        print(f"{os.path.basename(out)}: {n_steps + 1} rows (grasp), "
+        print(f"{os.path.basename(out)}: {n_trans + 1} rows (grasp, "
+              f"{1/frame_dt:.0f} Hz, pre-roll {rec.preroll_s:.3f} s), "
               f"{n_rec}/{n_sim} particles, {size:.1f} MB, {wall:.1f}s")
+        print(f"    approach {wp['speeds']['approach_m_s']:.3f} m/s, retract "
+              f"{wp['speeds']['retract_m_s']:.3f} m/s")
         print(f"    material mu={mu:.0f} Pa lambda={lam:.0f} Pa "
               f"(E={float(E):.0f} Pa, nu={float(nu):.4f}), rho={rho:.0f}")
     return out
@@ -835,51 +1012,89 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="data_mpm", help="output directory")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--task", choices=("settle", "grasp"), default="settle",
-                    help="'settle': passive gravity settling, no robot "
-                         "(default, unchanged behavior). 'grasp': scripted "
-                         "approach/close/retract via host/psm.py's PSM.")
+                    help="'settle': passive gravity settling from the spawn "
+                         "(reference) state, no robot. 'grasp': scripted "
+                         "approach/close/retract/release via host/psm.py, "
+                         "driven by --config.")
     ap.add_argument("--steps", type=int, default=None,
-                    help="recorded steps/episode (default: 100 for --task "
-                         "settle, 50 + n_release for --task grasp -- "
-                         "n_approach+n_close+n_retract+n_release's own "
-                         "defaults)")
-    ap.add_argument("--n-release", type=int, default=0,
-                    help="--task grasp only: length of a 4th scripted phase "
-                         "that reopens the jaw after retract, exercising "
-                         "GraspConstraint release (default 0: no release "
-                         "phase, matching prior behavior)")
-    ap.add_argument("--n-record", type=int, default=DEFAULT_N_RECORD,
-                    help="particles to record (solver simulates 24000)")
+                    help="--task settle only: recorded transitions (default "
+                         "0.5 s worth at --frame-dt). Grasp length comes from "
+                         "the config's durations.")
+    ap.add_argument("--frame-dt", type=float, default=None,
+                    help="recording interval, seconds (default 1/240, decision "
+                         "D1). --task grasp takes it from the config instead, "
+                         "and refuses a disagreeing value.")
+    ap.add_argument("--config", default=None,
+                    help="--task grasp: JSON config (configs/grasp_pilot.json). "
+                         "With a non-empty 'randomize' block each episode draws "
+                         "its own concrete config from its seed.")
+    ap.add_argument("--f-encoding", choices=trajectory_io.F_ENCODINGS,
+                    default="float32",
+                    help="tissue_F on disk (default float32: at 240 Hz the "
+                         "per-step dF of slow segments is comparable to "
+                         "delta16's quantisation, TODO_ASSESSMENT 4.5)")
+    ap.add_argument("--n-record", default=str(DEFAULT_N_RECORD),
+                    help="particles to record, or 'all' (solver simulates "
+                         "24000). Ignored when --particle-ids is given.")
+    ap.add_argument("--particle-ids", default=None,
+                    help=".npy of solver particle indices: ONE fixed node set "
+                         "for every episode (configs/particle_ids_*.npy)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--index", type=int, default=None,
                     help="collect exactly this one episode index and exit. Set "
                          "by the parent on each child; giving it by hand "
                          "collects a single episode without dispatching.")
+    ap.add_argument("--episode-config", default=None,
+                    help=argparse.SUPPRESS)   # set by the parent on grasp children
     args = ap.parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
 
     os.makedirs(args.out, exist_ok=True)
+    particle_ids = np.load(args.particle_ids) if args.particle_ids else None
+    n_record = (24000 if args.n_record == "all" else int(args.n_record))
+
+    def episode_kwargs(index: int, cfg_path: Optional[str]) -> dict:
+        kw = dict(seed=args.seed + index, n_record=n_record,
+                  f_encoding=args.f_encoding, particle_ids=particle_ids)
+        if args.task == "settle":
+            frame_dt = args.frame_dt if args.frame_dt is not None else 1.0 / 240.0
+            steps = args.steps if args.steps is not None \
+                else int(round(0.5 / frame_dt))
+            kw.update(n_steps=steps, frame_dt=frame_dt)
+        else:
+            with open(cfg_path) as fh:
+                kw["config"] = json.load(fh)
+            # The config's own seed wins: it is what makes Item 12's matched
+            # variants share a material (and therefore an initial state) while
+            # living under different episode indices.
+            if "seed" in kw["config"]:
+                kw["seed"] = int(kw["config"]["seed"])
+        return kw
+
     record = record_episode if args.task == "settle" else record_grasp_episode
-    default_steps = 100 if args.task == "settle" else 50 + args.n_release
-    steps = args.steps if args.steps is not None else default_steps
-    # record_episode() has no n_release parameter -- only pass it through for
-    # --task grasp.
-    extra_kwargs = {"n_release": args.n_release} if args.task == "grasp" else {}
 
     # THE CHILD BRANCH. `--index` present means "you are the one episode".
     # Dispatch never happens here, so recursion is structurally impossible
     # rather than merely unlikely -- the parent always passes --index, and a
     # process holding --index never spawns.
     if args.index is not None:
+        cfg_path = args.episode_config or (
+            _write_episode_config(args, args.index) if args.task == "grasp" else None)
         record(_episode_path(args.out, args.index),
-               n_steps=steps, seed=args.seed + args.index,
-               n_record=args.n_record, **extra_kwargs)
+               **episode_kwargs(args.index, cfg_path))
         return 0
+
+    # Grasp configs are resolved in the PARENT, one JSON per episode, saved
+    # next to the episode it produced: the to-do's "save the collection
+    # command/configuration" applies per episode once anything is randomised.
+    cfg_paths = [(_write_episode_config(args, i) if args.task == "grasp" else None)
+                 for i in range(args.episodes)]
+    _write_collection_record(args)
 
     # A single episode needs no isolation: there is nothing to collide with,
     # and a subprocess would add an interpreter start-up for nothing.
     if args.episodes == 1:
-        record(_episode_path(args.out, 0), n_steps=steps,
-               seed=args.seed, n_record=args.n_record, **extra_kwargs)
+        record(_episode_path(args.out, 0), **episode_kwargs(0, cfg_paths[0]))
         print(f"\nwrote 1 episode to {args.out}/")
         print(f"validate with: python host/validate_dataset.py --data {args.out}/")
         return 0
@@ -892,12 +1107,19 @@ def main(argv=None) -> int:
         cmd = [sys.executable, os.path.abspath(__file__),
                "--out", args.out,
                "--task", args.task,
-               "--steps", str(steps),
-               "--n-release", str(args.n_release),
-               "--n-record", str(args.n_record),
+               "--f-encoding", args.f_encoding,
+               "--n-record", args.n_record,
                "--seed", str(args.seed),
                "--index", str(i)]
-        print(f"[{i + 1}/{args.episodes}] {' '.join(cmd[-2:])} "
+        if args.steps is not None:
+            cmd += ["--steps", str(args.steps)]
+        if args.frame_dt is not None:
+            cmd += ["--frame-dt", repr(args.frame_dt)]
+        if args.particle_ids:
+            cmd += ["--particle-ids", args.particle_ids]
+        if cfg_paths[i]:
+            cmd += ["--episode-config", cfg_paths[i]]
+        print(f"[{i + 1}/{args.episodes}] --index {i} "
               f"-> {os.path.basename(_episode_path(args.out, i))}")
         # check=True so a diverged or crashed episode stops the run loudly.
         # Silently continuing would leave a gap in the numbering and a dataset
@@ -907,6 +1129,37 @@ def main(argv=None) -> int:
     print(f"\nwrote {args.episodes} episode(s) to {args.out}/")
     print(f"validate with: python host/validate_dataset.py --data {args.out}/")
     return 0
+
+
+def _write_episode_config(args, index: int) -> str:
+    """Resolve and save the concrete config for episode `index`.
+
+    Base config from --config (defaults if absent); if it has a randomize
+    block, draw this episode's values from its seed. The frame interval is
+    the config's -- a --frame-dt that disagrees is refused rather than
+    silently overriding either one.
+    """
+    base = collection_config.load_config(args.config)
+    if args.frame_dt is not None and abs(base["frame_dt_s"] - args.frame_dt) > 1e-12:
+        raise SystemExit(f"--frame-dt {args.frame_dt} disagrees with the config's "
+                         f"frame_dt_s {base['frame_dt_s']}; set it in one place")
+    cfg = (collection_config.sample_episode_config(base, args.seed + index)
+           if base.get("randomize") else dict(base, seed=args.seed + index))
+    path = os.path.splitext(_episode_path(args.out, index))[0] + ".config.json"
+    with open(path, "w") as fh:
+        fh.write(collection_config.config_to_json(cfg))
+    return path
+
+
+def _write_collection_record(args) -> None:
+    """Append the exact command line to <out>/collection_log.txt.
+
+    WHY: the to-do's deliverable is "the collection command/configuration".
+    Shell history is not a record; a file next to the data is.
+    """
+    with open(os.path.join(args.out, "collection_log.txt"), "a") as fh:
+        fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
+                " ".join(["python", "host/mpm_adapter.py"] + args.argv) + "\n")
 
 
 if __name__ == "__main__":

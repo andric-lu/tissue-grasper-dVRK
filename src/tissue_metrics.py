@@ -221,6 +221,10 @@ def compute_safety_strain(F: np.ndarray, p: float = 8.0, *,
         soft                 power-mean stretch over particles -- OPTIMISE THIS
         max                  true maximum stretch -- REPORT THIS
         n_above_threshold    how many particles exceed `threshold`
+        argmax               index of the particle carrying `max` (added
+                             20 Nov, DECISION_LOG 14.20; returned from the
+                             same stretch array so it cannot disagree with
+                             `max`, and costs no second SVD pass)
 
     `n_above_threshold` is the interpretable one: "41 particles past the tear
     stretch" is actionable in a way that "soft max 1.37" is not. It is a hard
@@ -231,6 +235,7 @@ def compute_safety_strain(F: np.ndarray, p: float = 8.0, *,
         "soft": soft_max(stretch, p=p, axis=-1),
         "max": np.max(stretch, axis=-1),
         "n_above_threshold": np.count_nonzero(stretch > threshold, axis=-1),
+        "argmax": np.argmax(stretch, axis=-1),
     }
 
 

@@ -84,6 +84,42 @@ Static (recorded once per episode):
                                    is a property of the solver, not of the
                                    universe. Record it.
 
+  -- added in v3.0 (the graph-model schema; field dictionary in
+     docs/FIELD_DICTIONARY.md, which is the authoritative description) --
+    rest_pos         (N,3) float32  reference (undeformed, F = I) position X of
+                                    every recorded node, aligned to particle_ids.
+                                    Empty = not recorded. NOT "frame 0" unless
+                                    the file says frame 0 is the reference state
+                                    (see preroll_s).
+    rest_pos_simulated (n_sim,3) float32  reference position of EVERY solver
+                                    particle. Lets a node set be re-chosen after
+                                    collection, and holds the true rest positions
+                                    of grasped particles that the recorded subset
+                                    misses. 288 KB at 24,000 particles.
+    material_field   (N,3) float32  per-node [log(mu), log(lambda), rho]; the
+                                    episode-level material_params broadcast for
+                                    homogeneous tissue.
+    control_dt       (1,) float64   seconds between successive actions. Empty =
+                                    not recorded.
+    preroll_s        (1,) float64   simulated seconds run BEFORE row 0 (a settle
+                                    pre-roll). 0.0 means row 0 is the reference
+                                    configuration itself. Empty = not recorded.
+    jaw_names        (K,) str       one name per jaw, fixing the order of every
+                                    (.., K, ..) array below. K = 2 for the PSM.
+    jaw_half_extents (K,3) float32  half-extents of each jaw's collision box, in
+                                    that box's own frame, metres.
+    jaw_box_offset   (K,7) float32  T_jaw_box: the box frame in the jaw-link
+                                    frame [x,y,z,qx,qy,qz,qw]. Recorded so the box
+                                    can be rebuilt from a jaw-link pose.
+    grasp_capture_radius (1,) float64  the two-jaw capture distance, metres
+    jaw_release_rad  (1,) float64   jaw angle at/above which a grasp releases
+    contact_radius   (1,) float64   node-to-jaw-surface distance that sets the
+                                    node-level contact flag, metres
+    robot_model      str            "dvrk_si_psm" | "dvrk_classic_psm_surrol";
+                                    "" = not recorded (a v3 file without it is Si)
+    robot_scale      (1,) float64   the arm's geometric scaling (SurRoL
+                                    globalScaling); 1 = life-size
+
 Per-step (T = number of steps, N = number of tissue nodes/particles):
     tissue_pos       (T,N,3) float32   node positions, metres, world frame
     tissue_vel       (T,N,3) float32   node velocities, m/s (zeros if unavailable)
@@ -102,6 +138,37 @@ Per-step (T = number of steps, N = number of tissue nodes/particles):
     contact_mode     (T,) int8         CONTACT_* enum below
     exposure         (T,) float32      logged success metric, see tissue_metrics
     safety_strain    (T,) float32      logged safety metric, see tissue_metrics
+
+  -- added in v3.0 --
+    time             (T,) float64      seconds since row 0. Row 0 is 0.0.
+    jaw_box_pose     (T,K,7) float32   each jaw collision box, world frame
+    jaw_box_vel      (T,K,6) float32   [v, omega] world frame, BACKWARD
+                                       difference (pose_t - pose_{t-1}) / dt;
+                                       row 0 is zero (the arm starts at rest).
+                                       The motion over t -> t+1 is the NEXT row's
+                                       value -- that is what the solver applied.
+    jaw_joint        (T,K) float32     each jaw's own joint angle, radians
+    node_contact     (T,N) bool        node within contact_radius of a jaw box
+                                       surface (proximity, NOT proof of contact)
+    phase            (T,) int8         scripted phase of each row, see
+                                       src/collection_config.PHASES
+    node_grasp       (T,N) bool        node-level grasp latch, derived by
+                                       src/tool_geometry.py's rule from recorded
+                                       geometry -- the same rule a model must use
+                                       at inference
+    grasp_full_ids_flat / grasp_full_ids_offset   CSR like grasp_ids below, but
+                                       FULL-SOLVER particle indices: the ground
+                                       truth of what the solver actually held
+    safety_strain_id (T,) int32        FULL-SOLVER index of the particle that
+                                       carried the logged safety_strain (the
+                                       argmax of max principal stretch over all
+                                       simulated particles). Added 20 Nov
+                                       (DECISION_LOG 14.20): without it nothing
+                                       in a subset file says whether the
+                                       logged peak was recordable at all.
+    safety_strain_pos (T,3) float32    that particle's world position, so its
+                                       distance to the jaws can be derived from
+                                       jaw_box_pose even when it is not a node
 
 Grasped node indices vary in length per step, so they are stored CSR-style:
     grasp_ids_flat    (sum_of_lengths,) int32
@@ -187,13 +254,13 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "3.0"
 
 # Every version this reader knows how to turn into a v2-shaped Trajectory.
 # A file claiming anything else cannot be interpreted safely, and guessing is
 # worse than stopping: silently misreading a field is how a whole training run
 # gets thrown away a week later.
-KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0", "2.1")
+KNOWN_SCHEMA_VERSIONS = ("1.0", "2.0", "2.1", "3.0")
 
 # How tissue_F may be laid out on disk. The reader normalises all of these to
 # float32 F, so this never leaks past load_trajectory(). See F ENCODINGS above.
@@ -320,6 +387,19 @@ class TrajectoryWriter:
         particle_ids: Optional[np.ndarray] = None,
         n_particles_simulated: int = 0,
         grid_dx: float = 0.0,
+        rest_pos: Optional[np.ndarray] = None,
+        rest_pos_simulated: Optional[np.ndarray] = None,
+        material_field: Optional[np.ndarray] = None,
+        control_dt: Optional[float] = None,
+        preroll_s: Optional[float] = None,
+        jaw_names: Optional[Sequence[str]] = None,
+        jaw_half_extents: Optional[np.ndarray] = None,
+        jaw_box_offset: Optional[np.ndarray] = None,
+        grasp_capture_radius: Optional[float] = None,
+        jaw_release_rad: Optional[float] = None,
+        contact_radius: Optional[float] = None,
+        robot_model: str = "",
+        robot_scale: Optional[float] = None,
     ):
         # Everything added in v2 is keyword-only. The four leading positional
         # arguments are kept positional because callers already pass them that
@@ -423,6 +503,48 @@ class TrajectoryWriter:
                     f"particle_ids max is {int(self.particle_ids.max())} but only "
                     f"{self.n_particles_simulated} particles were simulated")
 
+        # -- v3.0 static fields ------------------------------------------
+        # Each is either the measured value or an EMPTY array; never a zero
+        # stand-in (module docstring, READING v1 FILES).
+        self.rest_pos = _opt(rest_pos, np.float32, (-1, 3))
+        self.rest_pos_simulated = _opt(rest_pos_simulated, np.float32, (-1, 3))
+        self.material_field = _opt(material_field, np.float32, (-1, 3))
+        self.control_dt = _opt_scalar(control_dt)
+        self.preroll_s = _opt_scalar(preroll_s)
+        self.grasp_capture_radius = _opt_scalar(grasp_capture_radius)
+        self.jaw_release_rad = _opt_scalar(jaw_release_rad)
+        self.contact_radius = _opt_scalar(contact_radius)
+        self.robot_model = str(robot_model)
+        self.robot_scale = _opt_scalar(robot_scale)
+        self.jaw_names = np.asarray(list(jaw_names) if jaw_names is not None
+                                    else [], dtype=np.str_)
+        self.jaw_half_extents = _opt(jaw_half_extents, np.float32, (-1, 3))
+        self.jaw_box_offset = _opt(jaw_box_offset, np.float32, (-1, 7))
+        K = self.jaw_names.size
+        for name in ("jaw_half_extents", "jaw_box_offset"):
+            arr = getattr(self, name)
+            if arr.size and arr.shape[0] != K:
+                raise ValueError(f"{name} has {arr.shape[0]} rows but jaw_names "
+                                 f"names {K} jaws; every per-jaw array is "
+                                 "indexed by jaw_names order")
+        if self.control_dt.size and not self.control_dt[0] > 0:
+            raise ValueError(f"control_dt must be positive, got {self.control_dt[0]}")
+        if self.preroll_s.size and self.preroll_s[0] < 0:
+            raise ValueError(f"preroll_s must be >= 0, got {self.preroll_s[0]}")
+        # rest_pos_simulated is the full cloud; rest_pos must be its subset
+        # under particle_ids. Checked here because both arrive before append().
+        # WHY: two copies of the same reference positions that disagree mean
+        # the node features (x - X) are computed against the wrong particles.
+        if self.rest_pos.size and self.rest_pos_simulated.size \
+                and self.particle_ids.size:
+            if self.particle_ids.max() >= self.rest_pos_simulated.shape[0]:
+                raise ValueError("particle_ids index past rest_pos_simulated")
+            if not np.array_equal(self.rest_pos,
+                                  self.rest_pos_simulated[self.particle_ids]):
+                raise ValueError(
+                    "rest_pos != rest_pos_simulated[particle_ids]: the node "
+                    "reference positions are not those of the recorded particles")
+
         # Per-step buffers.
         self._pos, self._vel = [], []
         self._ee_pose, self._ee_vel = [], []
@@ -431,6 +553,11 @@ class TrajectoryWriter:
         self._grasp_ids_flat, self._grasp_offset = [], [0]
         self._F, self._contact_mode = [], []
         self._exposure, self._safety_strain = [], []
+        self._time, self._jaw_box_pose, self._jaw_box_vel = [], [], []
+        self._jaw_joint, self._node_contact, self._node_grasp = [], [], []
+        self._grasp_full_flat, self._grasp_full_offset = [], [0]
+        self._phase = []
+        self._safety_strain_id, self._safety_strain_pos = [], []
 
         # Shapes are locked in on the first append and enforced afterwards.
         # Catching a shape change at step 200 is far cheaper than discovering
@@ -445,15 +572,58 @@ class TrajectoryWriter:
 
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
 
+    # -- static fields known only after construction ---------------------
+    def set_static(self, **fields) -> None:
+        """Set v3 static fields that the caller learns after building the
+        writer (tool geometry exists only once the robot is constructed; the
+        pre-roll length only once it has run). Refused after the first
+        append(): a static field that changes mid-episode is not static, and
+        rows already accepted were validated against the old value.
+        """
+        if self._pos:
+            raise RuntimeError("set_static() after append(): static fields "
+                               "must be fixed before the first row")
+        allowed = {"jaw_names", "jaw_half_extents", "jaw_box_offset",
+                   "grasp_capture_radius", "jaw_release_rad", "contact_radius",
+                   "preroll_s", "control_dt", "robot_model", "robot_scale"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise TypeError(f"set_static() does not take {sorted(unknown)}")
+        for k in ("grasp_capture_radius", "jaw_release_rad", "contact_radius",
+                  "preroll_s", "control_dt", "robot_scale"):
+            if k in fields:
+                setattr(self, k, _opt_scalar(fields[k]))
+        if "robot_model" in fields:
+            self.robot_model = str(fields["robot_model"])
+        if "jaw_names" in fields:
+            self.jaw_names = np.asarray(list(fields["jaw_names"]), dtype=np.str_)
+        if "jaw_half_extents" in fields:
+            self.jaw_half_extents = _opt(fields["jaw_half_extents"], np.float32, (-1, 3))
+        if "jaw_box_offset" in fields:
+            self.jaw_box_offset = _opt(fields["jaw_box_offset"], np.float32, (-1, 7))
+        K = self.jaw_names.size
+        for name in ("jaw_half_extents", "jaw_box_offset"):
+            arr = getattr(self, name)
+            if arr.size and arr.shape[0] != K:
+                raise ValueError(f"{name} has {arr.shape[0]} rows, jaw_names has {K}")
+
     # -- context manager plumbing so `with` works --------------------------
     def __enter__(self) -> "TrajectoryWriter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # Write even if the episode crashed: a partial trajectory is usually
-        # still worth inspecting, and losing 20 minutes of sim to an exception
-        # in the last step is infuriating.
-        if len(self._pos) > 0:
+        # A CRASHED EPISODE IS NEVER SAVED UNDER ITS REAL NAME. The first
+        # version of this method wrote whatever rows it had to `path`, so a
+        # run that died at step 40 of 200 produced a normal-looking .npz that
+        # every check passed: shapes agree with each other, the timebase
+        # closes, and nothing records that 160 steps are missing. Rows are
+        # still worth inspecting, so they go to `<path>.partial` instead --
+        # a name list_trajectories() does not match, so no validator or
+        # training run can pick it up by accident.
+        if exc_type is not None:
+            if self._pos:
+                self.abort(f"{exc_type.__name__}: {exc}")
+        elif self._pos:
             self.close()
         return False  # never swallow the exception
 
@@ -474,20 +644,39 @@ class TrajectoryWriter:
         contact_mode: Optional[int] = None,
         exposure: Optional[float] = None,
         safety_strain: Optional[float] = None,
+        time: Optional[float] = None,
+        jaw_box_pose: Optional[np.ndarray] = None,
+        jaw_box_vel: Optional[np.ndarray] = None,
+        jaw_joint: Optional[np.ndarray] = None,
+        node_contact: Optional[np.ndarray] = None,
+        node_grasp: Optional[np.ndarray] = None,
+        grasp_full_ids: Optional[Sequence[int]] = None,
+        phase: Optional[int] = None,
+        safety_strain_id: Optional[int] = None,
+        safety_strain_pos: Optional[np.ndarray] = None,
     ) -> None:
         """Record one timestep. Keyword-only on purpose: positional args here
         would be a silent-bug factory once there are ten of them.
 
-        Every v2 field is optional. A collector with no constitutive model --
+        Every v2/v3 field is optional. A collector with no constitutive model --
         PyBullet mass-spring, which has no deformation gradient at all -- calls
-        this exactly as it did under v1 and gets a valid v2 file back.
+        this exactly as it did under v1 and gets a valid file back.
+
+        VALIDATE EVERYTHING, THEN STORE ANYTHING. The first version appended
+        tissue_pos to its buffer and only then validated the other fields, so
+        a rejected row left one buffer a row longer than the rest. A caller
+        that caught the ValueError and carried on (or __exit__ saving the
+        rows) then wrote arrays whose lengths disagreed by one -- the exact
+        off-by-one check_shapes_agree exists to catch, manufactured by the
+        writer itself. Every array below is built and checked into locals
+        first; the buffers are touched only in the final block.
         """
+        step = len(self._pos)
         pos = _as(tissue_pos, np.float32, (-1, 3))
-        if self._n_nodes is None:
-            self._n_nodes = pos.shape[0]
-        elif pos.shape[0] != self._n_nodes:
+        n_nodes = self._n_nodes if self._n_nodes is not None else pos.shape[0]
+        if pos.shape[0] != n_nodes:
             raise ValueError(
-                f"node count changed mid-episode: {self._n_nodes} -> {pos.shape[0]}. "
+                f"node count changed mid-episode: {n_nodes} -> {pos.shape[0]}. "
                 "Topology must be constant within one trajectory."
             )
 
@@ -505,23 +694,13 @@ class TrajectoryWriter:
         frc = _as(contact_force, np.float32, (3,)) if contact_force is not None \
             else np.zeros(3, np.float32)
 
+        widths = {}
         for name, arr, cache in (("action", act, "_n_action"),
                                  ("joint_pos", jnt, "_n_joints")):
             have = getattr(self, cache)
-            if have is None:
-                setattr(self, cache, arr.shape[0])
-            elif arr.shape[0] != have:
+            if have is not None and arr.shape[0] != have:
                 raise ValueError(f"{name} dim changed mid-episode: {have} -> {arr.shape[0]}")
-
-        self._pos.append(pos)
-        self._vel.append(vel)
-        self._ee_pose.append(pose)
-        self._ee_vel.append(evel)
-        self._jaw.append(np.float32(jaw))
-        self._joint.append(jnt)
-        self._action.append(act)
-        self._grasp_active.append(bool(grasp_active))
-        self._force.append(frc)
+            widths[cache] = arr.shape[0]
 
         ids = np.asarray(grasp_node_ids, np.int32).ravel() if grasp_node_ids is not None \
             else np.zeros(0, np.int32)
@@ -532,61 +711,175 @@ class TrajectoryWriter:
         # alias to the wrong recorded node whenever it happens to be < N, and
         # IndexError whenever it isn't -- catch it here, at the point the
         # caller that produced it is still on the stack.
-        if ids.size and (np.any(ids < 0) or np.any(ids >= self._n_nodes)):
+        if ids.size and (np.any(ids < 0) or np.any(ids >= n_nodes)):
             raise ValueError(
-                f"grasp_node_ids must satisfy 0 <= id < {self._n_nodes} (the "
+                f"grasp_node_ids must satisfy 0 <= id < {n_nodes} (the "
                 f"recorded node count N), got range [{int(ids.min())},"
-                f"{int(ids.max())}] at step {len(self._pos) - 1} -- looks "
+                f"{int(ids.max())}] at step {step} -- looks "
                 "like a full-solver particle index leaked through unmapped")
-        self._grasp_ids_flat.append(ids)
-        self._grasp_offset.append(self._grasp_offset[-1] + ids.size)
 
-        # --- optional v2 per-step fields ----------------------------------
-        if self._require_consistent("tissue_F", tissue_F is not None):
+        # --- optional per-step fields: decide presence, validate, stage ----
+        present = {}
+        staged = {}
+
+        def opt(name, value):
+            ok = self._check_consistent(name, value is not None, step)
+            present[name] = value is not None
+            return ok
+
+        if opt("tissue_F", tissue_F):
             F = _as(tissue_F, np.float32, (-1, 3, 3))
-            if F.shape[0] != self._n_nodes:
+            if F.shape[0] != n_nodes:
                 raise ValueError(
-                    f"tissue_F has {F.shape[0]} particles, tissue_pos has {self._n_nodes}")
-            self._F.append(F)
-        if self._require_consistent("contact_mode", contact_mode is not None):
+                    f"tissue_F has {F.shape[0]} particles, tissue_pos has {n_nodes}")
+            staged["_F"] = F
+        if opt("contact_mode", contact_mode):
             if int(contact_mode) not in CONTACT_MODE_NAMES:
                 raise ValueError(
                     f"contact_mode {contact_mode} is not one of "
                     f"{sorted(CONTACT_MODE_NAMES)} ({CONTACT_MODE_NAMES})")
-            self._contact_mode.append(np.int8(contact_mode))
-        if self._require_consistent("exposure", exposure is not None):
-            self._exposure.append(np.float32(exposure))
-        if self._require_consistent("safety_strain", safety_strain is not None):
-            self._safety_strain.append(np.float32(safety_strain))
+            staged["_contact_mode"] = np.int8(contact_mode)
+        if opt("exposure", exposure):
+            staged["_exposure"] = np.float32(exposure)
+        if opt("safety_strain", safety_strain):
+            staged["_safety_strain"] = np.float32(safety_strain)
 
-    def _require_consistent(self, name: str, present: bool) -> bool:
-        """Lock an optional field to present-or-absent on its first append.
+        K = self.jaw_names.size
+        if opt("time", time):
+            t_now = float(time)
+            # WHY: time is what turns row indices into seconds. Non-increasing
+            # time means two rows claim the same instant, and every velocity
+            # finite-differenced from them divides by zero or flips sign.
+            if self._time and not t_now > self._time[-1]:
+                raise ValueError(f"time must strictly increase: step {step} has "
+                                 f"{t_now} after {self._time[-1]}")
+            staged["_time"] = np.float64(t_now)
+        for name, width in (("jaw_box_pose", 7), ("jaw_box_vel", 6)):
+            value = {"jaw_box_pose": jaw_box_pose, "jaw_box_vel": jaw_box_vel}[name]
+            if opt(name, value):
+                arr = _as(value, np.float32, (-1, width))
+                if arr.shape[0] != K or K == 0:
+                    raise ValueError(f"{name} has {arr.shape[0]} jaws, jaw_names "
+                                     f"names {K}; pass jaw_names to the writer")
+                staged["_" + name] = arr
+        if opt("jaw_joint", jaw_joint):
+            arr = _as(jaw_joint, np.float32, (-1,))
+            if arr.shape[0] != K or K == 0:
+                raise ValueError(f"jaw_joint has {arr.shape[0]} jaws, jaw_names names {K}")
+            staged["_jaw_joint"] = arr
+        for name, value in (("node_contact", node_contact), ("node_grasp", node_grasp)):
+            if opt(name, value):
+                arr = _as(value, bool, (-1,))
+                if arr.shape[0] != n_nodes:
+                    raise ValueError(f"{name} has {arr.shape[0]} entries, "
+                                     f"tissue_pos has {n_nodes} nodes")
+                staged["_" + name] = arr
+        if opt("grasp_full_ids", grasp_full_ids):
+            full = np.asarray(grasp_full_ids, np.int32).ravel()
+            if full.size and (full.min() < 0 or (self.n_particles_simulated and
+                                                 full.max() >= self.n_particles_simulated)):
+                raise ValueError("grasp_full_ids outside [0, n_particles_simulated)")
+            staged["_grasp_full"] = full
+
+        if opt("phase", phase):
+            staged["_phase"] = np.int8(phase)
+
+        # The peak's id and position travel together: one without the other
+        # cannot answer "was the logged maximum on a recorded node, and where".
+        if (safety_strain_id is None) != (safety_strain_pos is None):
+            raise ValueError("safety_strain_id and safety_strain_pos must be "
+                             "supplied together")
+        if (safety_strain_id is not None) and safety_strain is None:
+            raise ValueError("safety_strain_id without safety_strain: the id names "
+                             "the particle carrying a value that was not logged")
+        if opt("safety_strain_id", safety_strain_id):
+            sid = int(safety_strain_id)
+            if sid < 0 or (self.n_particles_simulated and sid >= self.n_particles_simulated):
+                raise ValueError(f"safety_strain_id {sid} outside "
+                                 f"[0, {self.n_particles_simulated})")
+            staged["_safety_strain_id"] = np.int32(sid)
+        if opt("safety_strain_pos", safety_strain_pos):
+            staged["_safety_strain_pos"] = _as(safety_strain_pos, np.float32, (3,))
+
+        # --- commit: nothing above touched a buffer ------------------------
+        self._n_nodes = n_nodes
+        for cache, width in widths.items():
+            setattr(self, cache, width)
+        for name, is_present in present.items():
+            self._optional_present.setdefault(name, is_present)
+        self._pos.append(pos)
+        self._vel.append(vel)
+        self._ee_pose.append(pose)
+        self._ee_vel.append(evel)
+        self._jaw.append(np.float32(jaw))
+        self._joint.append(jnt)
+        self._action.append(act)
+        self._grasp_active.append(bool(grasp_active))
+        self._force.append(frc)
+        self._grasp_ids_flat.append(ids)
+        self._grasp_offset.append(self._grasp_offset[-1] + ids.size)
+        for buf, value in staged.items():
+            if buf == "_grasp_full":
+                self._grasp_full_flat.append(value)
+                self._grasp_full_offset.append(self._grasp_full_offset[-1] + value.size)
+            else:
+                getattr(self, buf).append(value)
+
+    def _check_consistent(self, name: str, present: bool, step: int) -> bool:
+        """Is an optional field present-or-absent the same way as on row 0?
 
         WHY: supplying `tissue_F` for some steps and not others yields an array
         shorter than `tissue_pos`, and every downstream index into it is then
         off by an amount that depends on which steps were skipped. Catching it
         at the step it happens names the field; catching it at training time
-        does not.
+        does not. Read-only: append() records the choice only after the whole
+        row has validated.
         """
         have = self._optional_present.get(name)
-        if have is None:
-            self._optional_present[name] = present
+        if have is None or have == present:
             return present
-        if have != present:
-            was, now = ("supplied", "omitted") if have else ("omitted", "supplied")
-            raise ValueError(
-                f"{name} was {was} on earlier steps and is {now} at step "
-                f"{len(self._pos) - 1}. Optional fields are all-or-nothing "
-                "within one episode.")
-        return present
+        was, now = ("supplied", "omitted") if have else ("omitted", "supplied")
+        raise ValueError(
+            f"{name} was {was} on earlier steps and is {now} at step "
+            f"{step}. Optional fields are all-or-nothing "
+            "within one episode.")
+
+    def abort(self, reason: str = "") -> Optional[str]:
+        """Save the rows so far to `<path>.partial` and never to `path`.
+
+        Returns the partial path, or None if there was nothing to save. The
+        file is a normal npz underneath (np.load reads it) with an extra
+        `partial_reason` string, but its name deliberately does not end in
+        .npz, so list_trajectories() -- and therefore the validator and every
+        training script -- never sees it.
+        """
+        if not self._pos:
+            return None
+        out = self.path + ".partial"
+        self._write(out, partial_reason=reason or "aborted")
+        return out
 
     def close(self) -> str:
+        """Write the episode to `path`, atomically.
+
+        WHY ATOMIC: np.savez_compressed writes the zip member by member. A
+        process killed mid-write (Ctrl-C, out of disk, the Mac sleeping) left a
+        truncated file under the real name. It is written to `<path>.tmp` and
+        renamed into place; a rename within one directory is all-or-nothing,
+        so `path` is either the complete episode or absent.
+        """
         if not self._pos:
             raise RuntimeError("nothing to write: append() was never called")
+        self._check_static_against_nodes()
+        tmp = self.path + ".tmp"
+        self._write(tmp)
+        os.replace(tmp, self.path)
+        self._pos.clear()  # so __exit__ does not write a second time
+        return self.path
 
-        flat = np.concatenate(self._grasp_ids_flat) if self._grasp_ids_flat \
-            else np.zeros(0, np.int32)
-
+    def _check_static_against_nodes(self) -> None:
+        """Static arrays that arrive before append() and so can only be
+        sized against the node count once rows exist."""
         # boundary_mask arrives before any append, so its length can only be
         # checked here. A mask sized to the wrong mesh silently clamps the wrong
         # particles, which looks like a physics bug rather than a bookkeeping one.
@@ -606,52 +899,109 @@ class TrajectoryWriter:
                 f"n_particles_simulated={self.n_particles_simulated} is fewer than "
                 f"the {self._n_nodes} nodes recorded; a subset cannot be larger "
                 "than the set it came from")
+        # WHY: per-node static arrays aligned to a different node set would be
+        # silently broadcast against the wrong particles by any consumer.
+        for name in ("rest_pos", "material_field"):
+            arr = getattr(self, name)
+            if arr.size and arr.shape[0] != self._n_nodes:
+                raise ValueError(f"{name} has {arr.shape[0]} rows but the "
+                                 f"episode has {self._n_nodes} nodes")
+        if self.rest_pos_simulated.size and self.n_particles_simulated and \
+                self.rest_pos_simulated.shape[0] != self.n_particles_simulated:
+            raise ValueError(
+                f"rest_pos_simulated has {self.rest_pos_simulated.shape[0]} rows, "
+                f"n_particles_simulated is {self.n_particles_simulated}")
+
+    def _write(self, target: str, partial_reason: Optional[str] = None) -> None:
+        """Serialise the buffers to `target` through a file handle.
+
+        Through a handle, not a filename, because np.savez_compressed appends
+        ".npz" to any filename that lacks it -- which would turn both
+        `<path>.tmp` and `<path>.partial` back into names the loader globs.
+        """
+        flat = np.concatenate(self._grasp_ids_flat) if self._grasp_ids_flat \
+            else np.zeros(0, np.int32)
+        full_flat = np.concatenate(self._grasp_full_flat) if self._grasp_full_flat \
+            else np.zeros(0, np.int32)
+        K = self.jaw_names.size
+
+        def stacked(buf, dtype, tail):
+            # Present-and-stacked, or the empty "not recorded" array.
+            return np.stack(buf).astype(dtype) if buf else np.zeros((0,) + tail, dtype)
 
         # Encoded on disk, always float32 in memory (see the reader). Under
         # "delta16" what lands in the file is F - I, which is why f_encoding is
         # written alongside it -- the bytes alone do not say which it is.
         tissue_F = _encode_F(np.stack(self._F) if self._F else None,
                              self.f_encoding)
+        extra = {} if partial_reason is None else {"partial_reason": partial_reason}
 
-        np.savez_compressed(
-            self.path,
-            schema_version=SCHEMA_VERSION,
-            f_encoding=self.f_encoding,
-            particle_ids=self.particle_ids,
-            n_particles_simulated=np.int32(self.n_particles_simulated),
-            grid_dx=np.float32(self.grid_dx),
-            simulator=self.simulator,
-            task=self.task,
-            dt=np.float32(self.dt),
-            notes=self.notes,
-            tissue_faces=self.tissue_faces,
-            tissue_tets=self.tissue_tets,
-            material_params=self.material_params,
-            substep_dt=np.float32(self.substep_dt),
-            n_substeps=np.int32(self.n_substeps),
-            boundary_mask=self.boundary_mask,
-            action_spec=self.action_spec,
-            target_origin=self.target_origin,
-            target_normal=self.target_normal,
-            target_extent=self.target_extent,
-            tissue_pos=np.stack(self._pos),
-            tissue_vel=np.stack(self._vel),
-            ee_pose=np.stack(self._ee_pose),
-            ee_vel=np.stack(self._ee_vel),
-            jaw=np.asarray(self._jaw, np.float32),
-            joint_pos=np.stack(self._joint),
-            action=np.stack(self._action),
-            grasp_active=np.asarray(self._grasp_active, bool),
-            contact_force=np.stack(self._force),
-            grasp_ids_flat=flat.astype(np.int32),
-            grasp_ids_offset=np.asarray(self._grasp_offset, np.int32),
-            tissue_F=tissue_F,
-            contact_mode=np.asarray(self._contact_mode, np.int8),
-            exposure=np.asarray(self._exposure, np.float32),
-            safety_strain=np.asarray(self._safety_strain, np.float32),
-        )
-        self._pos.clear()  # so __exit__ does not write a second time
-        return self.path
+        with open(target, "wb") as fh:
+            np.savez_compressed(
+                fh,
+                schema_version=SCHEMA_VERSION,
+                f_encoding=self.f_encoding,
+                particle_ids=self.particle_ids,
+                n_particles_simulated=np.int32(self.n_particles_simulated),
+                grid_dx=np.float32(self.grid_dx),
+                simulator=self.simulator,
+                task=self.task,
+                dt=np.float32(self.dt),
+                notes=self.notes,
+                tissue_faces=self.tissue_faces,
+                tissue_tets=self.tissue_tets,
+                material_params=self.material_params,
+                substep_dt=np.float32(self.substep_dt),
+                n_substeps=np.int32(self.n_substeps),
+                boundary_mask=self.boundary_mask,
+                action_spec=self.action_spec,
+                target_origin=self.target_origin,
+                target_normal=self.target_normal,
+                target_extent=self.target_extent,
+                tissue_pos=np.stack(self._pos),
+                tissue_vel=np.stack(self._vel),
+                ee_pose=np.stack(self._ee_pose),
+                ee_vel=np.stack(self._ee_vel),
+                jaw=np.asarray(self._jaw, np.float32),
+                joint_pos=np.stack(self._joint),
+                action=np.stack(self._action),
+                grasp_active=np.asarray(self._grasp_active, bool),
+                contact_force=np.stack(self._force),
+                grasp_ids_flat=flat.astype(np.int32),
+                grasp_ids_offset=np.asarray(self._grasp_offset, np.int32),
+                tissue_F=tissue_F,
+                contact_mode=np.asarray(self._contact_mode, np.int8),
+                exposure=np.asarray(self._exposure, np.float32),
+                safety_strain=np.asarray(self._safety_strain, np.float32),
+                # -- v3.0 --
+                rest_pos=self.rest_pos,
+                rest_pos_simulated=self.rest_pos_simulated,
+                material_field=self.material_field,
+                control_dt=self.control_dt,
+                preroll_s=self.preroll_s,
+                jaw_names=self.jaw_names,
+                jaw_half_extents=self.jaw_half_extents,
+                jaw_box_offset=self.jaw_box_offset,
+                grasp_capture_radius=self.grasp_capture_radius,
+                jaw_release_rad=self.jaw_release_rad,
+                contact_radius=self.contact_radius,
+                robot_model=self.robot_model,
+                robot_scale=self.robot_scale,
+                time=np.asarray(self._time, np.float64),
+                jaw_box_pose=stacked(self._jaw_box_pose, np.float32, (K, 7)),
+                jaw_box_vel=stacked(self._jaw_box_vel, np.float32, (K, 6)),
+                jaw_joint=stacked(self._jaw_joint, np.float32, (K,)),
+                node_contact=stacked(self._node_contact, bool, (self._n_nodes,)),
+                node_grasp=stacked(self._node_grasp, bool, (self._n_nodes,)),
+                phase=np.asarray(self._phase, np.int8),
+                grasp_full_ids_flat=full_flat.astype(np.int32),
+                grasp_full_ids_offset=(np.asarray(self._grasp_full_offset, np.int32)
+                                       if self._optional_present.get("grasp_full_ids")
+                                       else np.zeros(0, np.int32)),
+                safety_strain_id=np.asarray(self._safety_strain_id, np.int32),
+                safety_strain_pos=stacked(self._safety_strain_pos, np.float32, (3,)),
+                **extra,
+            )
 
 
 # --------------------------------------------------------------------------
@@ -720,6 +1070,19 @@ class Trajectory:
         off = self._d["grasp_ids_offset"]
         return self._d["grasp_ids_flat"][off[t]:off[t + 1]]
 
+    def grasp_full_ids(self, t: int) -> np.ndarray:
+        """FULL-SOLVER particle indices held by the grasp at step t (v3.0).
+        Empty for every step of a file that did not record them."""
+        off = self._d["grasp_full_ids_offset"]
+        if off.size == 0:
+            return np.zeros(0, np.int32)
+        return self._d["grasp_full_ids_flat"][off[t]:off[t + 1]]
+
+    @property
+    def has_jaws(self) -> bool:
+        """True when per-jaw tool geometry was recorded (schema 3.0 robot episodes)."""
+        return int(self._d["jaw_box_pose"].size) > 0
+
     def __repr__(self) -> str:
         sub = f" {self.n_nodes}/{int(self._d['n_particles_simulated'])}" \
             if self.is_subset else ""
@@ -738,7 +1101,7 @@ def load_trajectory(path: str) -> Trajectory:
         d = {k: z[k] for k in z.files}
     # numpy stores strings as 0-d arrays; unwrap them so they behave like str.
     for k in ("schema_version", "simulator", "task", "notes", "action_spec",
-              "f_encoding"):
+              "f_encoding", "partial_reason", "robot_model"):
         if k in d:
             d[k] = str(d[k])
 
@@ -779,10 +1142,41 @@ def _upgrade_in_place(d: dict) -> None:
         # a solver's particle array. Zeros would claim they all recorded
         # particle 0, which is worse than admitting the mapping is unknown.
         "particle_ids": np.int32,
+        # v3.0. Every one of these is "not recorded" in an older file. In
+        # particular an older file's frame 0 is NOT silently promoted to
+        # rest_pos: the to-do list forbids substituting the first recorded
+        # position for X unless it is the actual reference configuration, and
+        # only a v3 file records whether it is (preroll_s).
+        "rest_pos": np.float32,
+        "rest_pos_simulated": np.float32,
+        "material_field": np.float32,
+        "control_dt": np.float64,
+        "preroll_s": np.float64,
+        "jaw_half_extents": np.float32,
+        "jaw_box_offset": np.float32,
+        "grasp_capture_radius": np.float64,
+        "jaw_release_rad": np.float64,
+        "contact_radius": np.float64,
+        "time": np.float64,
+        "jaw_box_pose": np.float32,
+        "jaw_box_vel": np.float32,
+        "jaw_joint": np.float32,
+        "node_contact": bool,
+        "node_grasp": bool,
+        "grasp_full_ids_flat": np.int32,
+        "grasp_full_ids_offset": np.int32,
+        "phase": np.int8,
+        "robot_scale": np.float64,
+        # 20 Nov additions; every file before then has neither.
+        "safety_strain_id": np.int32,
+        "safety_strain_pos": np.float32,
     }
     for key, dtype in empty.items():
         if key not in d:
             d[key] = np.zeros(0, dtype)
+    d.setdefault("robot_model", "")
+    if "jaw_names" not in d:
+        d["jaw_names"] = np.zeros(0, np.str_)
 
     # Scalars where 0 is unambiguous: a solver cannot take zero substeps, so
     # zero reads as "not recorded" without colliding with a real value.
@@ -863,6 +1257,28 @@ def make_transition_pairs(traj: Trajectory, horizon: int = 1):
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+def _opt(arr, dtype, shape) -> np.ndarray:
+    """`_as`, except None becomes the EMPTY "not recorded" array."""
+    if arr is None:
+        return np.zeros((0,) + tuple(0 if x == -1 else x for x in shape[1:]), dtype)
+    return _as(arr, dtype, shape)
+
+
+def _opt_scalar(value) -> np.ndarray:
+    """A scalar stored as (1,) float64, or (0,) when not recorded.
+
+    WHY NOT 0.0 FOR "NOT RECORDED": the scalars this is used for (preroll_s,
+    the grasp radii) have 0 as a physically meaningful value, so the old
+    n_substeps trick of letting 0 mean "absent" would be a lie here.
+    """
+    if value is None:
+        return np.zeros(0, np.float64)
+    v = float(value)
+    if not np.isfinite(v):
+        raise ValueError(f"expected a finite scalar, got {value!r}")
+    return np.array([v], np.float64)
+
 
 def _as(arr, dtype, shape) -> np.ndarray:
     """Coerce to a contiguous array of `dtype`, checking `shape` (-1 = any)."""

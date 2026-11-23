@@ -1,0 +1,9 @@
+{
+  "sampler": "fps",
+  "n": 3000,
+  "seed": 0,
+  "radius_dx": 1.5,
+  "grid_dx_m": 0.015625,
+  "source": "mpm_0000.npz",
+  "rule": "fewest edges (reference + spatial at rest) among configurations whose reference and combined graphs have no isolated nodes and one component at every measured row"
+}

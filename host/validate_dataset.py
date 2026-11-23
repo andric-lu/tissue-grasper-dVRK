@@ -52,6 +52,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+import actions as actions_mod  # noqa: E402
+import tool_geometry  # noqa: E402
 from materials import suggested_substep_dt, unpack_material  # noqa: E402
 from tissue_metrics import (  # noqa: E402
     DEFAULT_GRID,
@@ -59,6 +61,7 @@ from tissue_metrics import (  # noqa: E402
     DEFAULT_THRESHOLD,
     compute_exposure,
     compute_safety_strain,
+    max_principal_stretch,
 )
 from trajectory_io import (  # noqa: E402
     CONTACT_GRASP,
@@ -99,6 +102,17 @@ MAX_BOUNDARY_DRIFT = 1e-5   # 10 um; a kinematic clamp should be exact, but a
                             # solver that re-solves constraints each substep can
                             # leave float-level residue. Deliberately far below
                             # any real deformation -- see check_boundary_is_held
+
+REST_F_TOLERANCE = 1e-6     # |F - I| at a frame that claims to BE the reference
+ACTION_POS_TOLERANCE = 1e-5 # m; decode(ee_pose[t], action[t]) vs ee_pose[t+1].
+                            # Both are float32 on disk: ~3e-8 m at 0.3 m, so
+                            # 1e-5 is 300x headroom and 100x below a 1 mm bug.
+ACTION_ROT_TOLERANCE = 1e-4 # rad, same reasoning for the rotation part
+JAW_VEL_TOLERANCE = (1e-3, 1e-2)  # (m/s, rad/s); float32 poses differenced
+                            # over 1/240 s carry ~1e-5 m/s of rounding
+RESIDUAL_WARN_FRACTION = 0.10  # integration residual as a fraction of the RMS
+                            # per-step displacement above which Item 7 says to
+                            # revisit the integration rule before training
 
 # The MPM grid spacing the substep check assumes. It is not in the schema, so
 # it has to be assumed somewhere; assume it loudly rather than silently.
@@ -178,7 +192,9 @@ def check_finite(tr) -> Result:
     # the traceback points at the optimiser rather than at the episode.
     bad = []
     for k in ("tissue_pos", "tissue_vel", "ee_pose", "ee_vel", "jaw",
-              "action", "contact_force", "tissue_F", "exposure", "safety_strain"):
+              "action", "contact_force", "tissue_F", "exposure", "safety_strain",
+              "rest_pos", "material_field", "time", "jaw_box_pose", "jaw_box_vel",
+              "jaw_joint"):
         arr = np.asarray(getattr(tr, k))
         if arr.size and not np.all(np.isfinite(arr)):
             bad.append(f"{k} ({np.count_nonzero(~np.isfinite(arr))} values)")
@@ -543,6 +559,7 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
         return Result(SKIP, "no logged metrics to compare")
 
     problems = []
+    notes = []      # WARN-level findings; see the safety_strain margin below
     if tr.exposure.size:
         got = compute_exposure(tr.tissue_pos.astype(np.float64), tr.target_origin,
                                tr.target_normal, tr.target_extent,
@@ -633,20 +650,36 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
             head = np.maximum(logged - 1.0, 1e-6)
             short = float(((logged - got) / head).max())
             if short > SUBSET_STRAIN_MARGIN:
-                problems.append(
-                    f"safety_strain over the stored subset underestimates the "
-                    f"logged value by {short:.0%} of the stretch above rest "
-                    f"(limit {SUBSET_STRAIN_MARGIN:.0%}); {tr.n_nodes} of "
-                    f"{int(tr.n_particles_simulated)} particles is too few to "
-                    "corroborate the safety metric")
+                msg = (f"safety_strain over the stored subset underestimates the "
+                       f"logged value by {short:.0%} of the stretch above rest "
+                       f"(limit {SUBSET_STRAIN_MARGIN:.0%}); {tr.n_nodes} of "
+                       f"{int(tr.n_particles_simulated)} particles is too few to "
+                       "corroborate the safety metric")
+                # WHY ONLY A WARN WHEN THE PEAK PARTICLE IS RECORDED (DECISION_LOG
+                # 14.24). This margin is a guess at "was the logged peak on a
+                # particle the subset could see". A file carrying
+                # safety_strain_id answers that exactly, and
+                # check_safety_peak_is_consistent checks the answer on every row
+                # where it applies. On the grid-BC debug set the margin FAILed 2
+                # of 8 grasp episodes whose exact check PASSed: the peak sat on
+                # a held particle the 3,000 nodes rarely include. Without the id
+                # (every file before 20 Nov 2026) the guess is all there is, so
+                # it stays a FAIL there.
+                if tr.safety_strain_id.size:
+                    notes.append(msg + "; downgraded: the exact peak-particle "
+                                 "check (safety peak is consistent) covers this file")
+                else:
+                    problems.append(msg)
         else:
             got = compute_safety_strain(tr.tissue_F)["max"]
             err = float(np.abs(got - tr.safety_strain.astype(np.float64)).max())
             if err > METRIC_TOLERANCE:
                 problems.append(f"safety_strain differs by up to {err:.2e}")
     if problems:
-        return Result(FAIL, "; ".join(problems) +
+        return Result(FAIL, "; ".join(problems + notes) +
                       f" (tolerance {METRIC_TOLERANCE:.0e})")
+    if notes:
+        return Result(WARN, "; ".join(notes))
     # WORDING MATTERS HERE. "reproduce" is a claim about equality, and for a
     # subset record it is false: the stored particles cannot reproduce a metric
     # computed over every particle, and are not supposed to. Saying they did
@@ -659,6 +692,408 @@ def check_logged_metrics_match_recomputation(tr) -> Result:
                             f"({tr.subset_fraction:.1%}): exposure not below, "
                             "peak stretch not above")
     return Result(PASS, f"logged metrics reproduce to {METRIC_TOLERANCE:.0e}")
+
+
+# --------------------------------------------------------------------------
+# Schema 3.0 checks (to-do Item 5). Each SKIPs on files that predate the field.
+# --------------------------------------------------------------------------
+
+@check()
+def check_positive_time_intervals(tr) -> Result:
+    """dt > 0, and the recorded timestamps advance by exactly dt."""
+    # WHY: dt is the denominator of every finite difference and the Δt of the
+    # position update the model integrates with. A zero or negative dt makes
+    # each velocity infinite or reversed; a `time` column that disagrees with
+    # dt means either the rows are not evenly spaced (frames dropped) or dt
+    # is mislabelled -- the timebase bug of section 9.5 in another costume.
+    dt = float(tr.dt)
+    if not dt > 0.0:
+        return Result(FAIL, f"dt = {dt!r} is not a positive interval")
+    if tr.time.size == 0:
+        return Result(SKIP, f"no timestamps recorded (schema {tr.schema_version}); "
+                            f"dt = {dt*1e3:.4f} ms is positive")
+    t = tr.time.astype(np.float64)
+    if t.shape != (len(tr),):
+        return Result(FAIL, f"time{t.shape} != ({len(tr)},)")
+    if t[0] != 0.0:
+        return Result(FAIL, f"time[0] = {t[0]} s; row 0 must be t = 0")
+    steps = np.diff(t)
+    if steps.size and not (steps > 0).all():
+        return Result(FAIL, f"time does not strictly increase (first at row "
+                            f"{int(np.argmax(steps <= 0)) + 1})")
+    rel = float(np.abs(steps - dt).max() / dt) if steps.size else 0.0
+    if rel > 1e-5:
+        return Result(FAIL, f"time steps differ from dt by up to {rel:.2%}: rows "
+                            "are not evenly spaced at the recorded interval")
+    msg = f"{len(tr)} rows at {dt*1e3:.4f} ms, span {t[-1]:.4f} s"
+    # 1e-6 relative: dt is stored float32 (7 significant digits), control_dt
+    # float64, so the same interval written to both differs at ~1e-8.
+    if tr.control_dt.size and abs(float(tr.control_dt[0]) - dt) > 1e-6 * dt:
+        return Result(WARN, msg + f"; control interval {float(tr.control_dt[0])*1e3:.4f} ms "
+                                  "differs from the recording interval -- each action "
+                                  "then spans more or less than one row")
+    return Result(PASS, msg)
+
+
+@check()
+def check_reference_configuration(tr) -> Result:
+    """rest_pos is aligned to the nodes, and is frame 0 exactly when the file says so."""
+    # WHY: x - X is the first node feature, so X wrong means every feature is
+    # wrong by a fixed offset the model will happily learn. Three ways it goes
+    # wrong: rest_pos taken from different particles than tissue_pos
+    # (alignment), frame 0 used as X after a pre-roll has already deformed the
+    # tissue (the to-do forbids this explicitly), or a "reference" state that
+    # is not undeformed (F != I there).
+    if tr.rest_pos.size == 0:
+        return Result(SKIP, f"no rest_pos recorded (schema {tr.schema_version}); "
+                            "frame 0 must not be assumed to be the reference")
+    N = tr.n_nodes
+    X = tr.rest_pos.astype(np.float64)
+    if X.shape != (N, 3):
+        return Result(FAIL, f"rest_pos{X.shape} != ({N}, 3)")
+    if not np.isfinite(X).all():
+        return Result(FAIL, "rest_pos has non-finite values")
+    if tr.rest_pos_simulated.size:
+        full = tr.rest_pos_simulated
+        if tr.particle_ids.size == 0:
+            if full.shape[0] != N or not np.array_equal(full, tr.rest_pos):
+                return Result(FAIL, "rest_pos_simulated given without particle_ids "
+                                    "and does not equal rest_pos")
+        elif not np.array_equal(full[tr.particle_ids], tr.rest_pos):
+            bad = int((full[tr.particle_ids] != tr.rest_pos).any(axis=1).sum())
+            return Result(FAIL, f"rest_pos != rest_pos_simulated[particle_ids] at "
+                                f"{bad} node(s): reference positions belong to "
+                                "different particles than the recorded nodes")
+    if tr.preroll_s.size == 0:
+        return Result(WARN, "rest_pos recorded but preroll_s is not, so whether "
+                            "frame 0 is the reference configuration is unknown")
+    pre = float(tr.preroll_s[0])
+    gap = float(np.linalg.norm(tr.tissue_pos[0].astype(np.float64) - X, axis=1).max())
+    if pre == 0.0:
+        if gap > 0.0:
+            return Result(FAIL, f"preroll_s = 0 says row 0 IS the reference, but "
+                                f"tissue_pos[0] differs from rest_pos by up to "
+                                f"{gap*1e3:.4f} mm")
+        if tr.has_F:
+            dev = float(np.abs(tr.tissue_F[0] - np.eye(3)).max())
+            if dev > REST_F_TOLERANCE:
+                return Result(FAIL, f"row 0 is labelled the reference state but "
+                                    f"max |F - I| there is {dev:.3g}")
+        return Result(PASS, "row 0 is the reference configuration (x = X, F = I)")
+    return Result(PASS, f"{pre:.3f} s pre-roll before row 0; row 0 sits up to "
+                        f"{gap*1e3:.2f} mm from the reference X, as it should")
+
+
+@check()
+def check_material_field(tr) -> Result:
+    """material_field is (N,3), finite, and matches material_params when homogeneous."""
+    # WHY: the per-node [log mu, log lambda, rho] are node features. A field
+    # broadcast from a different episode's material, or written in Pascals
+    # instead of natural logs, trains a model on the wrong stiffness label --
+    # and the label is exactly the input the model is meant to condition on.
+    if tr.material_field.size == 0:
+        return Result(SKIP, f"no material_field recorded (schema {tr.schema_version})")
+    mf = tr.material_field.astype(np.float64)
+    if mf.shape != (tr.n_nodes, 3):
+        return Result(FAIL, f"material_field{mf.shape} != ({tr.n_nodes}, 3)")
+    if not np.isfinite(mf).all():
+        return Result(FAIL, "material_field has non-finite values")
+    # log(Pa) for tissue is O(5-15); a raw-Pascal column would be O(1e2-1e6).
+    if mf[:, :2].max() > 30.0:
+        return Result(FAIL, f"material_field log-modulus columns reach "
+                            f"{mf[:, :2].max():.3g}: these look like Pascals, not "
+                            "natural logs")
+    homogeneous = bool((mf == mf[0]).all())
+    if tr.material_params.size and homogeneous:
+        if not np.allclose(mf[0], tr.material_params.astype(np.float64), rtol=0, atol=1e-6):
+            return Result(FAIL, f"homogeneous material_field {mf[0]} != episode "
+                                f"material_params {tr.material_params}")
+        return Result(PASS, "homogeneous, equals material_params broadcast to "
+                            f"{tr.n_nodes} nodes")
+    return Result(PASS if not homogeneous else WARN,
+                  "heterogeneous material field" if not homogeneous else
+                  "homogeneous field but no material_params to compare against")
+
+
+@check()
+def check_action_state_indexing(tr) -> Result:
+    """Row t's action carries ee_pose[t] to ee_pose[t+1]; the last row is a pad."""
+    # WHY: the to-do's contract is (G_t, a_t) -> G_{t+1}. If the collector
+    # stored the action that LED to row t instead (off by one), every training
+    # pair pairs a state with the next step's command; the model still fits,
+    # and the error only surfaces as an action-conditioning test (Item 12)
+    # that finds the model reacting one step late.
+    if tr.action_spec != "delta_pose_jaw":
+        return Result(SKIP, f"action_spec is {tr.action_spec!r}, not delta_pose_jaw")
+    a = tr.action.astype(np.float64)
+    if a.ndim != 2 or a.shape[1] != 7:
+        return Result(FAIL, f"delta_pose_jaw actions must be (T, 7), got {a.shape}")
+    ee = tr.ee_pose.astype(np.float64)
+    T = len(tr)
+    if T < 2:
+        return Result(SKIP, "fewer than two rows")
+    nxt, jaw_next = actions_mod.decode_action(ee[:-1], a[:-1])
+    pos_err = float(np.abs(nxt[:, :3] - ee[1:, :3]).max())
+    # Angle of the RELATIVE rotation, 2*atan2(|q_v|, |q_w|) on normalised
+    # quaternions (CLAUDE.md). The first version took the angle from a dot
+    # product, 2*atan2(sqrt(1-d^2), d), which is ill-conditioned at d ~ 1: a
+    # float32-stored quaternion with norm 0.99999994 read as a 3.7e-4 rad
+    # misalignment on the Classic arm's tool-down orientation (qw = 0).
+    qa = nxt[:, 3:] / np.linalg.norm(nxt[:, 3:], axis=1, keepdims=True)
+    qb = ee[1:, 3:] / np.linalg.norm(ee[1:, 3:], axis=1, keepdims=True)
+    rel = actions_mod.quat_multiply(qa, actions_mod.quat_conjugate(qb))
+    rot_err = float((2 * np.arctan2(np.linalg.norm(rel[:, :3], axis=1),
+                                    np.abs(rel[:, 3]))).max())
+    jaw_err = float(np.abs(jaw_next - tr.jaw[1:].astype(np.float64)).max())
+    if pos_err > ACTION_POS_TOLERANCE or rot_err > ACTION_ROT_TOLERANCE or jaw_err > 1e-5:
+        t_bad = int(np.argmax(np.abs(nxt[:, :3] - ee[1:, :3]).max(axis=1)))
+        return Result(FAIL, f"decode(ee_pose[t], action[t]) misses ee_pose[t+1] by "
+                            f"{pos_err*1e3:.4f} mm / {rot_err:.2e} rad / jaw "
+                            f"{jaw_err:.2e} rad (worst row {t_bad}): actions are not "
+                            "aligned (G_t, a_t) -> G_t+1")
+    if np.abs(a[-1, :6]).max() > 0.0:
+        return Result(FAIL, "the last row's pose delta is not the zero pad; there is "
+                            "no row T to move to")
+    return Result(PASS, f"{T-1} transitions reproduce the next row "
+                        f"({pos_err*1e6:.2f} um, {rot_err:.1e} rad); last row padded")
+
+
+@check()
+def check_jaw_geometry(tr) -> Result:
+    """Per-jaw pose, velocity, opening and geometry are present, shaped and consistent."""
+    # WHY: tool edges are rebuilt from jaw_box_pose + jaw_half_extents (the
+    # to-do forbids storing dynamic edges), so these arrays ARE the tool input.
+    # A velocity column that is not the difference of the pose column means
+    # the model is told the jaw moves differently from how it moved -- e.g. a
+    # forward difference labelled as backward, which is a one-step leak of
+    # the future into the present.
+    if not tr.has_jaws:
+        return Result(SKIP, f"no per-jaw geometry recorded (schema {tr.schema_version}"
+                            f", task {tr.task})")
+    T, K = len(tr), tr.jaw_names.size
+    bad = []
+    for name, shape in (("jaw_box_pose", (T, K, 7)), ("jaw_box_vel", (T, K, 6)),
+                        ("jaw_joint", (T, K)), ("jaw_half_extents", (K, 3)),
+                        ("jaw_box_offset", (K, 7))):
+        arr = getattr(tr, name)
+        if arr.shape != shape:
+            bad.append(f"{name}{arr.shape}!={shape}")
+        elif not np.isfinite(arr).all():
+            bad.append(f"{name} non-finite")
+    if bad:
+        return Result(FAIL, "; ".join(bad))
+    if (tr.jaw_half_extents <= 0).any():
+        return Result(FAIL, f"non-positive jaw half-extents {tr.jaw_half_extents}")
+    qn = np.linalg.norm(tr.jaw_box_pose[..., 3:].astype(np.float64), axis=-1)
+    if np.abs(qn - 1).max() > 1e-4:
+        return Result(FAIL, f"jaw_box_pose quaternions off the unit sphere by "
+                            f"{np.abs(qn - 1).max():.2e}")
+    want = tool_geometry.box_velocity_backward(tr.jaw_box_pose, float(tr.dt))
+    got = tr.jaw_box_vel.astype(np.float64)
+    ev = float(np.abs(got[..., :3] - want[..., :3]).max())
+    ew = float(np.abs(got[..., 3:] - want[..., 3:]).max())
+    if ev > JAW_VEL_TOLERANCE[0] or ew > JAW_VEL_TOLERANCE[1]:
+        return Result(FAIL, f"jaw_box_vel is not the backward difference of "
+                            f"jaw_box_pose: off by {ev:.3g} m/s, {ew:.3g} rad/s")
+    if K == 2 and tr.jaw.size:
+        # Each arm's convention for how the recorded jaw angle maps onto its
+        # two jaw joints (tool_geometry.JAW_JOINT_FACTORS). WHY: Si records a
+        # per-jaw angle and Classic a total opening; mixing them up halves or
+        # doubles every opening the model is told about.
+        model = tr.robot_model or "dvrk_si_psm"
+        if model not in tool_geometry.JAW_JOINT_FACTORS:
+            return Result(FAIL, f"unknown robot_model {model!r}: no jaw convention")
+        fac = np.asarray(tool_geometry.JAW_JOINT_FACTORS[model])
+        dj = float(np.abs(tr.jaw_joint.astype(np.float64)
+                          - tr.jaw.astype(np.float64)[:, None] * fac).max())
+        if dj > 1e-6:
+            return Result(FAIL, f"jaw_joint != jaw x {fac.tolist()} ({model}) by up "
+                                f"to {dj:.3g} rad")
+    scale = f", robot {tr.robot_model or 'dvrk_si_psm (assumed)'}" + (
+        f" x{float(tr.robot_scale[0]):g}" if tr.robot_scale.size else "")
+    return Result(PASS, f"{K} jaws x {T} rows{scale}; velocity = backward difference "
+                        f"(to {ev:.1e} m/s); jaw poses vs joint_pos need FK and are "
+                        "checked in host/smoke_test_psm.py, not here")
+
+
+@check()
+def check_node_indicators(tr) -> Result:
+    """node_contact / node_grasp reproduce from the file with the recorded rule."""
+    # WHY: these flags are node features, and Item 10 requires that inference
+    # derive them by an explicit rule, never from future ground truth. If the
+    # stored flags cannot be re-derived from stored positions and jaw poses by
+    # tool_geometry's rule, the training data used a rule the model will not
+    # have at inference -- a silent train/test mismatch.
+    if tr.node_grasp.size == 0 and tr.node_contact.size == 0:
+        return Result(SKIP, f"no node-level indicators recorded (schema "
+                            f"{tr.schema_version}, task {tr.task})")
+    if not tr.has_jaws:
+        return Result(FAIL, "node indicators recorded without the jaw geometry "
+                            "they are derived from")
+    T, N = len(tr), tr.n_nodes
+    for name in ("node_grasp", "node_contact"):
+        if getattr(tr, name).shape != (T, N):
+            return Result(FAIL, f"{name}{getattr(tr, name).shape} != ({T}, {N})")
+    radii = {k: getattr(tr, k) for k in ("grasp_capture_radius", "jaw_release_rad",
+                                         "contact_radius")}
+    missing = [k for k, v in radii.items() if v.size == 0]
+    if missing:
+        return Result(FAIL, f"rule parameters not recorded: {missing}")
+    pos = tr.tissue_pos.astype(np.float64)
+    boxes = tr.jaw_box_pose.astype(np.float64)
+    half = tr.jaw_half_extents.astype(np.float64)
+    contact = tool_geometry.derive_node_contact(pos, boxes, half,
+                                                float(radii["contact_radius"][0]))
+    grasp = tool_geometry.derive_node_grasp(
+        pos, boxes, half, tr.jaw.astype(np.float64),
+        capture_radius=float(radii["grasp_capture_radius"][0]),
+        release_rad=float(radii["jaw_release_rad"][0]))
+    nc = int((contact != tr.node_contact).sum())
+    ng = int((grasp != tr.node_grasp).sum())
+    if nc or ng:
+        return Result(FAIL, f"stored flags differ from the rule re-run on the file: "
+                            f"{nc} node_contact and {ng} node_grasp entries")
+    return Result(PASS, f"reproduced exactly; peak {int(tr.node_contact.sum(1).max())} "
+                        f"contact / {int(tr.node_grasp.sum(1).max())} grasp node(s)")
+
+
+@check()
+def check_full_resolution_grasp(tr) -> Result:
+    """grasp_full_ids agrees with grasp_active and with the recorded grasp_node_ids."""
+    # WHY: grasp_full_ids is the ground truth Item 11 checks the node-level
+    # stand-in against. It must be non-empty exactly while the solver says a
+    # grasp is active, frozen within one grasp, and its intersection with the
+    # recorded subset must be grasp_node_ids -- or the two "truths" in the file
+    # describe different grasps.
+    off = tr.grasp_full_ids_offset
+    if off.size == 0:
+        return Result(SKIP, f"no full-resolution grasp ids (schema {tr.schema_version})")
+    T = len(tr)
+    if off.shape != (T + 1,) or off[0] != 0 or (np.diff(off) < 0).any() \
+            or off[-1] != tr.grasp_full_ids_flat.size:
+        return Result(FAIL, "grasp_full_ids_offset is not a valid CSR offset array")
+    active = tr.grasp_active.astype(bool)
+    sizes = np.diff(off)
+    if ((sizes > 0) != active).any():
+        t = int(np.argmax((sizes > 0) != active))
+        return Result(FAIL, f"grasp_full_ids non-empty != grasp_active at row {t}")
+    ids = tr.particle_ids
+    for t in range(T):
+        full = tr.grasp_full_ids(t)
+        if ids.size:
+            pos = np.searchsorted(ids, full)
+            pos = np.clip(pos, 0, max(ids.size - 1, 0))
+            mapped = np.sort(pos[ids[pos] == full])
+            if not np.array_equal(mapped, np.sort(tr.grasp_ids(t))):
+                return Result(FAIL, f"row {t}: grasp_node_ids is not the recorded "
+                                    "subset of grasp_full_ids")
+        if t and active[t] and active[t - 1] and \
+                not np.array_equal(full, tr.grasp_full_ids(t - 1)):
+            return Result(FAIL, f"full-resolution grasp membership changes mid-grasp "
+                                f"at row {t}")
+    if not active.any():
+        return Result(PASS, "recorded; no grasp in this episode")
+    first = int(np.argmax(active))
+    return Result(PASS, f"{tr.grasp_full_ids(first).size} solver particle(s) held for "
+                        f"{int(active.sum())} row(s); "
+                        f"{tr.grasp_ids(first).size} of them are recorded nodes")
+
+
+@check()
+def check_safety_peak_is_consistent(tr) -> Result:
+    """The logged peak-stretch particle agrees with the stored state wherever it was recorded."""
+    # WHY: safety_strain_id / safety_strain_pos name the particle that carried
+    # the logged maximum (DECISION_LOG 14.20). They are only worth having if
+    # they are right, and on a row where that particle IS a recorded node they
+    # can be checked exactly: its stored position must be safety_strain_pos,
+    # and its stored F must reproduce the logged value -- a stale id (logged
+    # one substep late), an index into the subset instead of the solver
+    # array, or a peak taken from a different F than the logged max would
+    # each break one of those. Rows where the peak particle is NOT recorded
+    # cannot be checked and are counted, not passed: that count is exactly
+    # the "the subset could not see the peak" fraction the old margin
+    # guessed at.
+    sid, spos = tr.safety_strain_id, tr.safety_strain_pos
+    if sid.size == 0:
+        return Result(SKIP, "no safety_strain_id recorded (files before 20 Nov 2026)")
+    T = len(tr)
+    if sid.shape != (T,) or spos.shape != (T, 3) or tr.safety_strain.shape != (T,):
+        return Result(FAIL, f"safety_strain_id {sid.shape} / safety_strain_pos "
+                            f"{spos.shape} do not match {T} rows of safety_strain")
+    n_sim = int(tr.n_particles_simulated) if np.size(tr.n_particles_simulated) else 0
+    if (sid < 0).any() or (n_sim and (sid >= n_sim).any()):
+        return Result(FAIL, f"safety_strain_id outside [0, {n_sim})")
+    ids = tr.particle_ids
+    if ids.size == 0 or tr.tissue_F.size == 0:
+        return Result(SKIP, "no particle_ids or tissue_F to check the peak against")
+    col = np.clip(np.searchsorted(ids, sid), 0, ids.size - 1)
+    seen = ids[col] == sid
+    rows = np.flatnonzero(seen)
+    # An id that claims "not recorded" while safety_strain_pos is EXACTLY a
+    # recorded node's position names the wrong particle: positions of distinct
+    # particles do not coincide to the bit. This is what catches an index into
+    # the recorded subset written where a solver index belongs -- that index
+    # usually lands on an unrecorded particle, and the exact check below would
+    # simply never run (found by its test, 20 Nov).
+    for t in np.flatnonzero(~seen):
+        hit = np.flatnonzero((tr.tissue_pos[t] == spos[t]).all(axis=1))
+        if hit.size:
+            return Result(FAIL, f"row {t}: safety_strain_id {int(sid[t])} is not a "
+                                f"recorded particle, but safety_strain_pos is exactly "
+                                f"recorded particle {int(ids[hit[0]])}'s position")
+    for t in rows:
+        c = int(col[t])
+        dx = float(np.abs(tr.tissue_pos[t, c] - spos[t]).max())
+        if dx > 0.0:
+            return Result(FAIL, f"row {t}: safety_strain_pos differs from the recorded "
+                                f"position of particle {int(sid[t])} by {dx:.2e} m")
+        got = float(max_principal_stretch(tr.tissue_F[t, c].astype(np.float64)))
+        if abs(got - float(tr.safety_strain[t])) > METRIC_TOLERANCE:
+            return Result(FAIL, f"row {t}: particle {int(sid[t])}'s stored F gives "
+                                f"stretch {got:.4f}, logged peak is "
+                                f"{float(tr.safety_strain[t]):.4f}")
+    if rows.size == 0:
+        return Result(SKIP, f"the peak particle is never a recorded node "
+                            f"(0 of {T} rows); nothing to check it against")
+    return Result(PASS, f"peak particle recorded on {rows.size} of {T} rows, all "
+                        f"consistent; on the other {T - rows.size} the recorded "
+                        f"nodes cannot see the logged peak")
+
+
+@check()
+def check_integration_residual(tr) -> Result:
+    """Item 7 pre-check: how far x_t+1 = x_t + dt*v_t+1 misses the recorded x_t+1."""
+    # WHY: the model will predict v_t+1 and integrate positions with exactly
+    # this rule. MPM advances positions over n_substeps with the velocity of
+    # each substep, not the frame-end velocity, so the rule leaves a residual
+    # under any acceleration (under gravity alone it is ~g*dt^2/2 per row).
+    # If that residual is comparable to the per-step motion, position error
+    # in training is the integrator's, not the model's -- and Item 7 says to
+    # fix the interval or the rule before diagnosing the model.
+    if len(tr) < 2 or not np.abs(tr.tissue_vel).max() > 0:
+        return Result(SKIP, "fewer than two rows, or no velocities recorded")
+    x = tr.tissue_pos.astype(np.float64)
+    v = tr.tissue_vel.astype(np.float64)
+    dt = float(tr.dt)
+    step = x[1:] - x[:-1]
+    res = step - dt * v[1:]
+    keep = np.ones(x.shape[:2], bool)[1:]
+    note = ""
+    if tr.node_grasp.size:
+        # Grasped nodes are kinematically driven, not integrated: excluded,
+        # and said so, rather than allowed to dominate the statistic.
+        keep = ~tr.node_grasp[1:].astype(bool)
+        note = ", grasped nodes excluded"
+    r = np.linalg.norm(res, axis=-1)[keep]
+    d = np.linalg.norm(step, axis=-1)[keep]
+    rms_r, rms_d = float(np.sqrt((r ** 2).mean())), float(np.sqrt((d ** 2).mean()))
+    frac = rms_r / max(rms_d, 1e-15)
+    msg = (f"residual RMS {rms_r*1e6:.2f} um, max {r.max()*1e6:.1f} um vs per-step "
+           f"motion RMS {rms_d*1e6:.1f} um (ratio {frac:.3f}{note})")
+    if frac > RESIDUAL_WARN_FRACTION:
+        return Result(WARN, msg + f" -- above {RESIDUAL_WARN_FRACTION:.0%}; consider "
+                                  "the interval or integration rule before training")
+    return Result(PASS, msg)
 
 
 # --------------------------------------------------------------------------
@@ -735,6 +1170,35 @@ def check_material_is_diverse(trs) -> Result:
                         f"{len(with_mat)} episode(s), sd(log mu)={spread_log[0]:.2f}")
 
 
+@check(scope="dataset")
+def check_node_identity_is_shared(trs) -> Result:
+    """Every episode records the same particles, from the same reference cloud."""
+    # WHY: node i must be the same piece of tissue in every episode, or a
+    # model's per-node errors, the MLP baseline's input vector and any
+    # cross-episode comparison mix different particles. Before schema 3.0
+    # every seed drew its own random subset, so this was violated by design
+    # (TODO_ASSESSMENT 4.4). The reference cloud is checked too: it is
+    # identical only because Taichi's RNG is unseeded, and if that ever
+    # changes the same particle_ids would name different places.
+    with_ids = [t for t in trs if t.particle_ids.size]
+    if len(with_ids) < 2:
+        return Result(SKIP, "fewer than two episodes record particle_ids")
+    ref = with_ids[0].particle_ids
+    differ = [os.path.basename(t.path) for t in with_ids[1:]
+              if not np.array_equal(t.particle_ids, ref)]
+    if differ:
+        return Result(WARN, f"{len(differ)} of {len(with_ids)} episode(s) record a "
+                            f"different node set (e.g. {differ[0]}); node i is a "
+                            "different particle across episodes -- collect with "
+                            "--particle-ids")
+    with_rest = [t for t in with_ids if t.rest_pos.size]
+    if len(with_rest) >= 2 and not all(np.array_equal(t.rest_pos, with_rest[0].rest_pos)
+                                       for t in with_rest[1:]):
+        return Result(WARN, "same particle_ids but different rest_pos: the reference "
+                            "cloud changed between episodes")
+    return Result(PASS, f"{len(with_ids)} episodes share one {ref.size}-node set")
+
+
 # --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
@@ -758,6 +1222,13 @@ def run(data_dir: str, verbose: bool = False, colour: bool = True) -> int:
         return 1
 
     print(f"validating {len(files)} episode(s) in {data_dir}/\n")
+    partials = sorted(f for f in os.listdir(data_dir) if f.endswith(".partial"))
+    if partials:
+        # WHY SAY SO: a crashed episode is saved as <name>.partial and is
+        # deliberately invisible to the loader. Silence about it would let a
+        # 10-episode run with 2 crashes look like an 8-episode run by design.
+        print(f"NOTE: {len(partials)} crashed episode(s) kept as .partial and "
+              f"NOT validated: {', '.join(partials[:5])}\n")
     tally = {PASS: 0, WARN: 0, SKIP: 0, FAIL: 0}
     trs, failed_files = [], []
 

@@ -81,14 +81,13 @@ import actions                                            # noqa: E402
 import trajectory_io                                       # noqa: E402
 import psm                                                  # noqa: E402
 
-# Reuse mpm_adapter.py's CONTACT_STICK_RADIUS_M value (kept as an
-# independently-defined constant, not an import, to avoid a circular import:
-# mpm_adapter.py imports this module, so this module cannot import
-# mpm_adapter.py back). If that constant changes, change this one to match --
-# it is already calibrated to roughly (jaw half-extent + one grid cell),
-# which is the same physical scale relevant to "close enough to be captured
-# by a rigid grasp."
-GRASP_CAPTURE_RADIUS_M = 0.02
+# The rule's two constants live in src/tool_geometry.py, the numpy module the
+# collector, validator and graph builder all use to derive the NODE-level grasp
+# flag (decision D3). Imported from there so the solver's rule and the
+# node-level rule cannot drift apart. Values unchanged: 0.02 m is roughly
+# (jaw half-extent + one grid cell), the same scale as mpm_adapter.py's
+# CONTACT_STICK_RADIUS_M.
+from tool_geometry import GRASP_CAPTURE_RADIUS_M  # noqa: E402
 
 # [judgment call] Release must be driven by an explicit jaw-angle command,
 # never by geometric drift -- the whole point of persistence is that a
@@ -98,7 +97,7 @@ GRASP_CAPTURE_RADIUS_M = 0.02
 # (JAW_OPEN_RAD=1.0 in mpm_adapter.py) -- there is no hardware reference to
 # calibrate this more precisely; verify empirically that tissue separates
 # cleanly once forcing stops at this angle (host/smoke_test_grasp.py).
-JAW_RELEASE_TRIGGER_RAD = 0.3
+from tool_geometry import JAW_RELEASE_TRIGGER_RAD  # noqa: E402  (0.3 rad)
 
 
 class GraspConstraint:
@@ -166,6 +165,11 @@ class GraspConstraint:
     def is_active(self) -> bool:
         return self._active
 
+    def full_ids(self) -> np.ndarray:
+        """FULL-SOLVER indices currently held (empty when not active). A copy,
+        so a caller storing it per row cannot alias the live membership."""
+        return self._full_ids.copy()
+
     # -- freeze / release --------------------------------------------------
 
     def maybe_freeze(self, rec, robot: "psm.PSM", pose_t: np.ndarray,
@@ -185,13 +189,13 @@ class GraspConstraint:
 
         poses = robot.jaw_box_poses()
         d = {}
-        for link_name in psm.JAW_LINKS:
+        for link_name in robot.jaw_links:
             box_pos, box_quat = poses[link_name]
             half_extents = robot.jaw_half_extents(link_name)
             local = (pos_full - box_pos) @ psm.rotmat_from_quat(box_quat)
             d[link_name] = np.linalg.norm(
                 np.maximum(np.abs(local) - half_extents, 0.0), axis=-1)
-        name1, name2 = psm.JAW_LINKS
+        name1, name2 = robot.jaw_links
         selected = (d[name1] < GRASP_CAPTURE_RADIUS_M) & (d[name2] < GRASP_CAPTURE_RADIUS_M)
         full_ids = np.flatnonzero(selected).astype(np.int32)
         if full_ids.size == 0:

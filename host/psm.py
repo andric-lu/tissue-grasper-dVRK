@@ -246,15 +246,26 @@ class PSM:
         for name in INERT_JOINTS:
             p.resetJointState(self.body, self._joint_index[name], 0.0)
 
+        self.jaw_links = JAW_LINKS
+        self.model_name = "dvrk_si_psm"
+        self.scaling = 1.0
+        self._register_proxies(mpm3d_module)
+
+    def _register_proxies(self, mpm3d_module) -> None:
+        """Build the two jaw box proxies and the dummy, and register them in
+        the solver's co_obj slots. Shared by every arm model (host/psm_classic.py
+        calls it too): everything here is about the vendored collision path,
+        nothing about which arm the jaws belong to. Needs self.jaw_links and
+        a _build_jaw_proxy() for this arm."""
         # Owned here, and only here -- see module docstring point 3.
         mpm3d_module.init_pos()
 
         self._proxy: Dict[str, dict] = {}
-        for link_name in JAW_LINKS:
+        for link_name in self.jaw_links:
             self._proxy[link_name] = self._build_jaw_proxy(link_name)
         self._latest_box_pose: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._prev_box_pose: Dict[str, Optional[Tuple[np.ndarray, np.ndarray]]] = \
-            {name: None for name in JAW_LINKS}
+            {name: None for name in self.jaw_links}
 
         dummy_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.001] * 3)
         self._dummy_id = _create_proxy_body(dummy_shape)
@@ -270,8 +281,8 @@ class PSM:
         self._dummy_inv_rot = np.eye(3, dtype=np.float32)
         self._dummy_inv_pos = -DUMMY_POSITION.astype(np.float32)
 
-        mpm3d_module.co_obj[0] = [self._proxy[JAW_LINKS[0]]["id"], 0]
-        mpm3d_module.co_obj[1] = [self._proxy[JAW_LINKS[1]]["id"], 0]
+        mpm3d_module.co_obj[0] = [self._proxy[self.jaw_links[0]]["id"], 0]
+        mpm3d_module.co_obj[1] = [self._proxy[self.jaw_links[1]]["id"], 0]
         mpm3d_module.co_obj[2] = [self._dummy_id, 0]
         # Every slot is a real link (index 0 of a one-link proxy body), never
         # a body's base -- see module docstring point 1.
@@ -332,7 +343,7 @@ class PSM:
         mpm_adapter.py's record_grasp_episode() for the exact ordering): this
         reads the END-of-frame jaw transforms."""
         i_rot_list, i_pos_list = [], []
-        for link_name in JAW_LINKS:
+        for link_name in self.jaw_links:
             box_pos, box_quat = self._jaw_box_pose(link_name)
             p.resetBasePositionAndOrientation(
                 self._proxy[link_name]["id"], box_pos.tolist(), box_quat.tolist())
@@ -361,7 +372,7 @@ class PSM:
         self._prev_box_pose starts at None and there is no prior frame to
         difference against; consistent with starting from a momentarily
         static hover pose)."""
-        for slot, link_name in enumerate(JAW_LINKS):
+        for slot, link_name in enumerate(self.jaw_links):
             box_pos, box_quat = self._latest_box_pose[link_name]
             prev = self._prev_box_pose[link_name]
             if prev is None:
@@ -464,10 +475,26 @@ class PSM:
         update_collision_geometry()). For a caller that wants jaw geometry
         for diagnostics (e.g. a contact_mode estimate) without that method's
         side effects on the solver."""
-        return {name: self._jaw_box_pose(name) for name in JAW_LINKS}
+        return {name: self._jaw_box_pose(name) for name in self.jaw_links}
 
     def jaw_half_extents(self, link_name: str) -> np.ndarray:
         return self._proxy[link_name]["half_extents"]
+
+    def jaw_joint_values(self, jaw: float) -> np.ndarray:
+        """(K,) each jaw's own joint angle for gripper opening `jaw` (rad).
+        Si: jaw_joint_1 = +jaw and its mimic jaw_joint_2 = -jaw, so `jaw`
+        is the PER-JAW angle (total opening 2*jaw)."""
+        return np.array([jaw, -jaw], np.float64)
+
+    def jaw_box_offset(self, link_name: str) -> np.ndarray:
+        """(7,) T_jaw_box = [local_center, identity quaternion], scalar-last.
+
+        Recorded into schema-3.0 episodes so a jaw box can be rebuilt from a
+        jaw-link pose (tool_geometry.compose_box_pose) without this class.
+        The rotation is identity by construction -- see _jaw_box_pose().
+        """
+        c = self._proxy[link_name]["local_center"]
+        return np.array([c[0], c[1], c[2], 0.0, 0.0, 0.0, 1.0], np.float64)
 
     def workspace_aabb(self, n_samples: int = 200,
                         rng: Optional[np.random.Generator] = None
