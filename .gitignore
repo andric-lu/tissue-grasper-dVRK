@@ -49,3 +49,10 @@ env/
 # --- Claude Code -------------------------------------------------------------
 # Per-machine tool permissions, not project configuration.
 .claude/settings.local.json
+CLAUDE.md
+
+# Schema-3.0 collection and study output (DECISION_LOG section 14): full-
+# resolution pilots are ~350 MB each, and every file here is regenerable.
+data_pilot/
+data_debug/
+runs/

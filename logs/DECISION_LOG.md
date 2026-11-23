@@ -2678,3 +2678,854 @@ on real solver noise; mass damping failing the rigid-translation invariance
 Kelvin–Voigt passes; a permuted index, a dropped message and a mis-routed edge
 in the scatter check; R = 0.5h shattering every node set; unweighted exposure
 reading clear under full cover.
+
+---
+
+## 14. Session 6 — 22 October 2026: the to-do list, schema 3.0, and the graph builder (Items 1–6)
+
+> Written the same day. Covers the gap since §13 (the 25 Sep cleanup and the
+> 5 Oct decisions were never logged here) and the implementation of the PhD
+> to-do list's Items 1–6 (`Soft_Tissue_World_Model_TODOLIST.docx`). Assessment
+> and plan: Project doc `claude/TODO_ASSESSMENT_AND_PLAN.md`.
+
+### 14.1 What happened between §13 and today
+
+- **25 Sep cleanup.** The §9.6–§13 study scripts were removed (`substep_study`,
+  `energy_audit`, `mpm_energy`, `mpm_locality_study`, `locality_attribution`,
+  `coarsening_study`, `graph_stats`, `mps_scatter_check`, `src/energy_ledger.py`,
+  `src/damping.py`); docs moved to `logs/`. **History was rewritten on 22 Oct to
+  strip AI attribution trailers, so hashes older than that are void**; the
+  removed code is recoverable from `git show 8749e36:<path>` (tip of
+  `phase0-measure`).
+- **5 Oct decisions.** (a) Run the simulator natively on macOS; Docker later
+  only on x86 + NVIDIA. (b) The target arm is the **dVRK Classic**, matching the
+  lab; the current `psm_Si_model/` does not. (c) Remote sessions reach the repo
+  through a Linux ARM VM that cannot run Taichi, Metal or PyBullet.
+- **22 Oct.** `cleanup` merged into `main` (`2d45c77`). Work for Items 1–6 on
+  branch `todo-items-1-6`.
+
+### 14.2 Decisions D1–D5, and the precedence rule
+
+Alternatives and tradeoffs are in the assessment doc §5. Decided 22 Oct, with
+the rule **"where an answer conflicts with the to-do list, the list's
+configuration wins"**:
+
+| # | Decision | Outcome |
+|---|---|---|
+| D1 | Recording rate | **240 Hz** (Δt = 1/240 s). `--frame-dt`, default 1/240. At 80 Hz Phase 0 needs M ≥ 14–18. |
+| D2 | Arm | Pilot on the Si `psm.py`; **the Item 6 debug set goes through SurRoL's robot interface** (`Psm1`, Classic), because Item 6 says so. That puts the Classic swap on the critical path for the debug set. `host/check_surrol_interface.py` is its first step. |
+| D3 | Grasp flag g | Two **separate** node-level indicators (Item 1): `g_contact` (proximity) and `g_grasp` (the solver's two-jaw latch evaluated on nodes). "g omitted" is the ablation. |
+| D4 | Node count | 3,000 baseline; the extra comparison row is **1,000** (the list: "reduce toward 1,000 only if needed"), not Phase 0's 600. Radii 1.5/2.0/2.5 × grid_dx as listed. |
+| D5 | Boundary flag b | Constant-zero slot, documented; boundary handling is not tested. |
+
+### 14.3 Phase 0 integrity fixes (assessment §4.6)
+
+- **A crashed episode is saved as `<name>.npz.partial`, never as `<name>.npz`.**
+  `TrajectoryWriter.__exit__` and `MPMRecorder.__exit__` used to save whatever
+  rows existed under the real name; the comparability check compares N, action
+  width and dt, none of which a truncation changes. The `.partial` file holds a
+  `partial_reason`; `list_trajectories` does not match it; `validate_dataset`
+  prints how many exist.
+- **`append()` validates the whole row before touching any buffer.** It used to
+  store `tissue_pos` first, so a rejected row left buffers of unequal length,
+  and the optional-field lock was recorded even for a rejected first row.
+- **`close()` is atomic** (write `<path>.tmp`, `os.replace`). Writes go through a
+  file handle because `np.savez_compressed` appends `.npz` to bare names.
+- The `zeros(7)` vs `jaw[-1]` last-row pad difference is left: Item 5's
+  convention never uses the last row's action.
+
+### 14.4 Schema 3.0
+
+Field-by-field meaning in `docs/FIELD_DICTIONARY.md` (the Item 5 deliverable).
+Only additions; 1.0/2.0/2.1 files load with every new field empty.
+
+- **`rest_pos` is read off the solver before the first substep**, where
+  `init_cube()` has just set F = I — the reference configuration by the solver's
+  own definition of F, asserted at collection. It is **not** frame 0 in general:
+  `preroll_s` records how long was simulated before row 0, and the validator
+  FAILs a file whose row 0 differs from `rest_pos` while claiming no pre-roll
+  (the to-do's "do not substitute the first recorded position for X").
+- `rest_pos_simulated` (all 24,000, 288 KB) lets node sets be re-chosen and holds
+  the true rest positions of grasped particles the subset misses.
+- `time`, `control_dt`, `phase`; per-jaw `jaw_box_pose` (achieved), `jaw_box_vel`
+  (**backward** difference, row 0 zero — known at time t without the future),
+  `jaw_joint`; static `jaw_names`, `jaw_half_extents`, `jaw_box_offset`, and the
+  rule radii; `node_contact`, `node_grasp`; `grasp_full_ids` (ground truth).
+- **Indexing** unchanged and now written down: T rows, `(G_t, a_t) → G_{t+1}`
+  for t ≤ T−2, one zero pad action on the last row. Checked.
+- **F defaults to `float32`** for collection (assessment §4.5).
+- **One fixed node set**: `--particle-ids <file>` for every episode. A new
+  dataset-wide check WARNs when episodes record different node sets.
+- New validator checks, each demonstrated failing on corrupted data in
+  `tests/test_schema_v3.py`: positive time intervals, reference configuration,
+  material field, action/state indexing, jaw geometry, node indicators (must
+  re-derive exactly), full-resolution grasp, integration residual (Item 7's
+  pre-check, reported now so the number exists before Item 7), node identity.
+
+### 14.5 The node-level grasp rule (`src/tool_geometry.py`)
+
+- One module computes box distance, `g_contact`, the `g_grasp` latch and jaw
+  velocities, imported by the collector, the validator, the graph builder and —
+  later — inference. `grasp_constraint.py` now takes its two constants from it.
+- The latch mirrors `_capture_row`'s order: freeze (if nothing held, latch every
+  node within 20 mm of BOTH jaws), then release (jaw ≥ 0.3 rad).
+- **Known divergence from the solver.** The solver freezes once, over all
+  particles. The node rule freezes over nodes; if the solver's 1–3 particles
+  are not near any node, the node latch can stay empty and fire on a later row
+  when a node comes within range of both closed jaws. That is the documented
+  node-level stand-in, not a bug; Item 11 compares it with `grasp_full_ids`.
+- Flags are computed from float32-rounded geometry (what the file stores), so
+  the validator's re-derivation matches exactly rather than to within rounding.
+
+### 14.6 The grasp script as a config (`src/collection_config.py`, `configs/`)
+
+- Units are seconds and metres; frame counts are derived. At 80 Hz the old
+  frame counts were also physical durations, and moving to 240 Hz would
+  otherwise have tripled every speed silently.
+- The default geometry reproduces §10's verified waypoints exactly at 80 Hz
+  (test), except that the orientation quaternion is now normalised (the literal
+  had norm 1.000058; components move by < 1e-4).
+- `record_grasp_episode(n_approach=…)` (the smoke tests' call) still runs the
+  §10 script at 80 Hz with no pre-roll.
+- **Inherited, flagged, not chosen:** the approach/retract speed is ~0.56 m/s,
+  fast for surgical retraction. **Placeholder:** `preroll_s = 0.5` until the
+  settle pilot shows how long the tissue takes to come to rest.
+- Randomisation (`configs/grasp_debug_set.json`): grasp point ±2 cm in x, y;
+  retraction within a 20° cone; 6–12 cm at the nominal speed; material from the
+  seed. Matched-initial-state variants for Item 12 share a seed and differ only
+  in retraction (test: their waypoints are identical up to the retract phase).
+- Each episode is saved next to its exact config; each run appends its command
+  line to `collection_log.txt`. `src/split_manifest.py` picks held-out episodes
+  before windowing, hashes every file, and keeps matched variants on one side.
+
+### 14.7 The graph builder (`src/graph_builder.py`)
+
+- Edge i→j stores receiver-minus-sender quantities. Reference edges (8 features)
+  from X, fixed per episode; spatial edges (7) from x, rebuilt every row; a pair
+  in both keeps both. Tool edges (14) jaw→tissue only, chosen by unsigned surface
+  distance < r_c, carrying the signed distance. Node features 21 (19 with g
+  omitted; omitted columns are dropped, not zeroed). Tool nodes 25, including the
+  commanded action. No absolute position anywhere.
+- **The radius search is exactly symmetric by construction**: the expanded
+  |a|²−2a·b+|b|² form only proposes candidates; the decision uses Σ(pⱼ−pᵢ)²,
+  which is bitwise the same for (i, j) and (j, i).
+- Tests show each property check failing on a broken graph first (one-way
+  edges, self-loops, out-of-range ids, an absolute-position feature).
+
+### 14.8 Item 3 on a proxy cloud (before any pilot)
+
+`host/sampling_study.py --proxy-cloud`: 24,000 points uniform in init_cube's box —
+the same distribution, not the same points. Reference graph at rest:
+
+| n | sampler | 1.0 dx | 1.5 dx | 2.0 dx | 2.5 dx |
+|---|---|---|---|---|---|
+| 3000 | FPS | deg 7.7, min 1 | deg 24.5, min 7 | 54.4 | 97.5 |
+| 3000 | voxel | deg 7.8, min 1 | 25.0, min 6 | 56.4 | 100.2 |
+| 3000 | random | **4 components, 2 isolated** | 27.7, min 3 | 60.4 | 106.4 |
+| 1000 | random | — | **2 components, 1 isolated** | 19.6 | 34.7 |
+
+Coverage (worst particle-to-node distance): FPS 9.1 mm, voxel 11.9 mm, random
+18.0 mm at n = 3,000. Measured FPS pitch ≈ 10.1 mm (the assessment's 11.5 mm
+estimate was high), so 1.5/2.0/2.5 dx = 2.3/3.1/3.9 pitches. All 3,000-node
+graphs at the to-do's radii are connected; even the smallest has mean degree
+~25, above the 10–20 that GNS-style models use.
+
+**The open tradeoff, not decided here.** The `--recommend` rule (fewest edges
+with no isolated nodes) picks FPS at 1.5 dx = 23 mm. With the to-do's 4
+message-passing blocks that is a receptive field of 94 mm, short of Phase 0's
+1% influence radii at 1/240 s (130 mm soft, 160–170 mm mid/stiff; §13). 2.5 dx
+gives 156 mm at ~4× the edges. More blocks at a small radius is the other route.
+To be decided on the pilot, with deformed rows, and recorded here.
+
+### 14.9 Item 4: `host/visualize_graph.py`
+
+Images at rest / contact / grasp / strong retraction / release (settle: rest,
+peak motion, end), statistics over time, and a PASS/WARN/FAIL checklist:
+indexing, spatial edges re-checked against a brute-force distance matrix,
+reference edges constant while stretched, fold edges, degree blow-up, material
+fragmentation of the reference and combined graphs, and tool-edge coverage of
+contact-flagged nodes. Shown to FAIL fragmentation at a radius below the node
+spacing.
+
+### 14.10 A collection-cost finding
+
+The adapter logs `exposure` every row over all 24,000 particles. Profiled in the
+container: **~0.47 s per row**, 70% of an episode's wall time. At 240 Hz a 1.5 s
+grasp episode has ~360 rows. Options, not decided: log it every k rows (a
+schema change), speed up `_coverage`, or stop logging it during debug
+collection (Item 10 defers exposure metrics anyway). Measure on the Mac first.
+
+### 14.11 Found, not fixed
+
+`python src/synthetic_traj.py --kinds all` fails on `main` before any of this
+work: one synthetic kind's substep_dt × n_substeps misses dt by 0.27% and the
+writer's timebase guard refuses it. Separate bug.
+
+### 14.12 Not verified this session
+
+Nothing here ran Taichi, Metal, PyBullet or SurRoL. The adapter's new paths
+were exercised against numpy stand-ins for the solver, arm and grasp constraint
+(`tests/test_adapter_fake_solver.py`), which checks bookkeeping, not physics.
+**Re-run on the Mac before collecting:** `smoke_test_mpm.py`,
+`smoke_test_psm.py`, `smoke_test_grasp.py` (adapter and `grasp_constraint.py`
+import changes; the correction kernel is untouched), then the pilots.
+
+### 14.13 Verification
+
+```
+pytest tests/ -q                       (Python 3.13, numpy 2.2.6)   366 passed, 1 skipped
+pytest tests/ -q                       (Python 3.10, numpy 1.23.5)  365 passed, 2 skipped
+python src/trajectory_io.py            OK
+python host/sampling_study.py --proxy-cloud --recommend             self-check PASS
+python host/visualize_graph.py <stand-in grasp episode> --video     7/7 PASS
+python host/check_surrol_interface.py  (container: no taichi/pybullet/surrol, fails cleanly)
+```
+
+### 14.14 The first schema-3.0 pilots (run on the Mac, same evening)
+
+Smoke tests unchanged: MPM 16/16 (1 expected WARN), PSM 17/17, grasp 8/8.
+Pilots at 240 Hz, all 24,000 particles recorded, float32 F, seed 0
+(μ = 3758 Pa, λ = 69 kPa, ν = 0.474, ρ = 1004):
+
+| | settle | grasp |
+|---|---|---|
+| rows, size, wall time | 240, 315 MB, 43 s | 241 (+0.5 s pre-roll), 319 MB, 53 s |
+| validator | 0 FAIL, 3 WARN | 0 FAIL, 3 WARN; every new v3 check PASS |
+
+The §14.10 exposure-cost worry does not hold on the Mac: a whole grasp
+pilot, pre-roll included, took 53 s.
+
+**Settling (sets `preroll_s`).** Mean particle speed 188 mm/s at 21 ms
+(the drop), 9.1 mm/s at 0.5 s, 1.9 mm/s at 0.75 s, 0.42 mm/s at 1.0 s.
+The 0.5 s placeholder leaves the tissue moving at ~9 mm/s when the tool
+arrives.
+
+**Integration residual (Item 7's pre-check).** The to-do's rule
+x_{t+1} = x_t + Δt·v_{t+1} misses recorded positions by RMS 29.4 µm against
+216.6 µm of motion per row (settle; 13.6%), 75.6 µm during the drop. The
+trapezoid rule x_{t+1} = x_t + Δt·(v_t + v_{t+1})/2 gives 4.7 µm (2.2%), six
+times smaller, at no extra cost (v_t is a model input already). Grasp
+episode, grasped nodes excluded: 13.6 µm vs 8.6 µm against 67 µm of motion.
+Decide at Item 7.
+
+**The grasp tears the tissue.** The solver held **12** particles (not 1–3),
+and the node-level latch selected exactly those 12. Retraction lifted them the
+full 0.1397 m while only 32 of 24,000 particles moved more than 20 mm: the
+grasp drew out a thin strand, reference edges stretched to 13.3× rest. On
+release the strand recoiled at 1.6 m/s (the validator's divergence WARN, and
+the 8.3 mm integration-residual maximum, are both this) and **did not rejoin**:
+the material stays in two pieces to the end of the episode. In MPM, particles
+pulled out of each other's kernel support stop interacting; this is numerical
+fracture, not tissue mechanics. It is the jaw-smaller-than-a-grid-cell problem
+recorded on 5 Oct, now measured. Retraction over 14 cm at 0.56 m/s makes it
+worst, but any pull on 12 particles separates them eventually.
+
+**A bug in my Item 4 checklist, found by this pilot.** "No material
+fragmentation" tested the combined graph, which contains the fixed reference
+edges and therefore can never come apart; it PASSed the torn strand. It now
+treats reference edges stretched beyond 3× rest as torn and checks what is
+still connected: on this pilot it FAILs (2 pieces from row 130 on). A test
+reproducing the strand fails on the old check and passes on the new one.
+
+**Item 3 on the real cloud** agrees with the proxy: FPS at 1.5 × grid_dx
+(145,832 edges at rest) recommended, voxel runner-up; written to
+`configs/particle_ids_3000.npy`. The receptive-field caveat of §14.8 stands.
+
+**SurRoL check, `tissue-host` env:** gym and surrol not installed (expected:
+SurRoL `main` needs numpy < 1.24, `tissue-host` has numpy 2.4.6). Step 3 PASSED:
+in one process with PyBullet, the MPM exposes x, v, F, particle_ids and
+rest_pos (Item 6's condition, solver side).
+
+**Blocking the Item 6 debug set:** the grasp-scale decision. Collecting it
+now would train Stage B on numerical tearing.
+
+### 14.15 The grasp-scale decision: short slow pulls (option 1) and the Classic arm at ×5 (option 3)
+
+**Decided 22 Oct**, from four options set out after 14.14: (1) shorter, slower
+pulls; (2) a larger capture radius (a fictional "suction cup"); (3) scale the
+robot ×5, as SurRoL's own tasks do, through SurRoL's Classic `Psm1`; (4) a
+128³ grid (~16× cost, jaw still sub-cell). Andric chose **1 and 3**.
+
+**What was built.**
+- `host/psm_classic.py` — `ClassicPSM`: SurRoL `main` a903fa6 `Psm1` at
+  `scaling=5`, behind the same interface as `host/psm.py`, which was made
+  arm-agnostic (`jaw_links`, `_register_proxies`, `jaw_joint_values`).
+  Commands go through SurRoL's RCM-frame path (`pose_world2rcm` → SurRoL's own
+  `inverse_kinematics`, exactly what `Psm.move()` does internally) and are
+  applied with SurRoL's `reset_joint` (its parallel-link and jaw mapping).
+  `move()` itself is not called: it only sets motor targets for a dynamic
+  physics step, which this project never takes — measured: a 5 mm `move()`
+  left the arm where it was (residual 5.000 mm). The RCM is placed by
+  measurement at (0.25, 0.35, 0.60) m; at zero joints the Classic tool points
+  straight down, so retraction is a pure insertion-axis pull.
+- **Measured Classic jaw**: a box primitive, 1.4 × 10.2 × 1.8 mm at scale 1 —
+  smaller than the Si jaw. At ×5: half-extents 3.5 × 25.5 × 4.5 mm, centred
+  25.5 mm along each jaw. PyBullet reports the box frame relative to the
+  link's INERTIAL frame; composed with the inertial offset by measurement.
+- **Jaw conventions differ, and the file says which**: Si `jaw` is the
+  per-jaw angle (joints `[+jaw, −jaw]`); Classic `jaw` is SurRoL's total
+  opening (joints `[−jaw/2, +jaw/2]`, 80° open). New static fields
+  `robot_model` and `robot_scale`; `tool_geometry.JAW_JOINT_FACTORS`; the
+  validator checks `jaw_joint` against the recorded model's convention.
+- **Config `arm` block** (`model`, `scaling`, `rcm_position_m`) and three
+  configs: `grasp_pilot.json` (Si, option 1), `grasp_pilot_classic.json`
+  (Classic ×5 + option 1), `grasp_debug_set.json` (Classic ×5, randomised).
+  All: 1.0 s pre-roll (14.14), 4 cm approach at 0.1 m/s, close 0.125 s, hold
+  0.1 s, **2 cm retraction at 4 cm/s** (debug set: 1–3 cm), release 0.125 s,
+  0.25 s recoil window. 361 rows at 240 Hz.
+- `host/setup_tissue_sim.sh` — the simulation environment (Py 3.10,
+  numpy 1.23.5, taichi 1.7.4, pybullet 3.2.6, gym 0.21 `--no-deps
+  --no-build-isolation`, roboticstoolbox-python 1.4.4, SurRoL `-e`).
+- `host/grasp_pilot_report.py` — the retraction-vs-tearing numbers.
+
+**Physical reading of ×5 (not applied, recorded).** The MPM world is
+unchanged (1 m domain, real gravity, placeholder materials). With the arm at
+5× life size, the 300 × 300 × 50 mm slab stands for ~60 × 60 × 10 mm of
+tissue, and the 2 cm pull for a 4 mm one. Mapping material, density and time
+to real tissue needs a similarity scaling that is not applied; no result
+should be read in real-tissue units until it is.
+
+**Verification — real solver, real SurRoL, in the cloud container.** The
+container is x86_64 Linux, where Taichi 1.7.4 and PyBullet have wheels, so the
+real adapter ran on CPU (27 ms/substep, ~40× slower than Metal). Seed 0
+material (μ = 3758 Pa, λ = 69 kPa), all 24,000 particles recorded:
+
+| | Si, §10 pull (14 cm, 0.56 m/s) | Si, option 1 (2 cm, 4 cm/s) | **Classic ×5 + option 1** |
+|---|---|---|---|
+| particles held | 12 | 30 | **123** |
+| followed > 25 / 50 / 75 % of the lift | 12 / 12 / 12 | 232 / 77 / 32 | **764 / 432 / 270** |
+| max reference-edge stretch | 13.3× | 1.90× | 2.94× |
+| material pieces (edges > 3× torn) | **2** | 1 | 1 |
+| peak speed | 1.6 m/s, release recoil | 0.31 m/s, retract | 0.72 m/s, jaw close |
+
+`check_surrol_interface.py`: 5/5 PASS (imports; `Psm1`; MPM x/v/F/ids; the
+×5 `ClassicPSM` posed, closed and stepped on the live solver; SurRoL's URDF) —
+the 5 Oct deciding check, run end to end. Validator on both new pilots: every
+v3 check PASS; node-level grasp rule reproduces exactly, and at full
+resolution selects exactly the solver's held set.
+
+**What the Classic ×5 pilot still shows, open.**
+- **The bite crushes the tissue between the jaws.** The highest stretches are
+  all on edges touching held particles and are already 2.5× at the moment of
+  grasp, before any pull; det F reaches 0.18–2.88 locally (395 particles,
+  1.7%, at grasp; bulk median |J − 1| = 0.003). A sticky 7 mm-thick box
+  closing on the tissue to a zero gap, and the grasp constraint zeroing the
+  held particles' F_C, both act here. Not tearing; the next thing to tune
+  (bite depth: the closed jaws reach ~3 cm into a 5 cm slab; closing speed:
+  80° in 0.125 s puts 274 particles above 0.3 m/s).
+- **Residual distortion after release** (max stretch 2.90× on the last row,
+  44 edges > 2×): the bite region has not recovered within the 0.25 s window.
+- **The validator needs ~6 GB on a 361-row full-resolution episode** (killed
+  at the container's 8 GB cap; ran on the Mac for 241 rows). Debug-set
+  episodes record 3,000 nodes and are unaffected. Chunking deferred.
+
+**Found and fixed on the way.**
+- `check_action_state_indexing` took rotation error from a dot product,
+  2·atan2(√(1−d²), d), ill-conditioned at d ≈ 1: the Classic tool-down
+  quaternion (qw = 0) stored as float32 read as a 3.7e-4 rad misalignment.
+  Now the relative quaternion's 2·atan2(|q_v|, |q_w|) (CLAUDE.md's rule); a test
+  shows both the false FAIL gone and a real 10 mrad misalignment still caught.
+
+Tests: 370 passed, 1 skipped, on Python 3.13/numpy 2.2.6 and on the tissue-sim
+stack (Python 3.10, numpy 1.23.5, real Taichi + PyBullet + SurRoL).
+
+### 14.16 The Classic ×5 pilot on the Mac, and the cloud depends on the backend
+
+Mac (Metal, tissue-sim env), `configs/grasp_pilot_classic.json`, seed 0: 361 rows
+in 106 s. `check_surrol_interface.py` 5/5 PASS on macOS.
+
+| | container (CPU, x64) | Mac (Metal) |
+|---|---|---|
+| held | 123 | 134 |
+| followed > 25 / 50 / 75 % | 764 / 432 / 270 | 724 / 415 / 266 |
+| max stretch / at end | 2.94 / 2.90 | 3.84 / 3.06 |
+| pieces | 1 | 1 |
+| peak speed | 0.72 m/s, close | 0.76 m/s, close |
+
+Same conclusion: retraction, not tearing. **The difference has a cause worth
+recording: the initial particle cloud depends on the Taichi backend.**
+`rest_pos_simulated` differs between the two files (md5 56ad2d7e… Metal vs
+cc2cd481… x64; first particle (0.335, 0.228, 0.099) vs (0.295, 0.308, 0.077)).
+`ti.random()` is deterministic per backend, not across backends, so "the cloud
+is identical in every episode" (§9.7) holds **only on one backend**.
+Consequences: `configs/particle_ids_3000.npy` (chosen on the Metal cloud) is
+valid only for Metal-collected episodes; collect a dataset on one backend, and
+re-run `sampling_study.py --write-ids` before collecting anywhere else (a CUDA
+cluster). `check_node_identity_is_shared` WARNs if rest_pos differs across
+episodes, which is exactly this case.
+
+On the Mac run the max stretch (3.84×) exceeds the 3× tear threshold on some
+edges at the bite, yet the material stays one piece: the over-stretched edges
+are local to the jaw-crushed region (§14.15), not a cut through the tissue.
+
+### 14.17 19 November 2026: state check before the Item 6 debug set
+
+Nothing was committed after §14.16; all of §14 lives as uncommitted changes on
+`todo-items-1-6`. Re-checked today:
+
+- `pytest tests/ -q`: 370 passed, 1 skipped in both `tissue-host`
+  (numpy 2.x) and `tissue-sim` (Python 3.10, numpy 1.23).
+- **The Mac's `tissue-sim` env is not what `host/setup_tissue_sim.sh` builds.**
+  It lives under `/opt/anaconda3`, not the miniforge install that holds
+  `tissue-host`; it has no `gym`, SurRoL is **not** pip-installed (no editable
+  link), and `roboticstoolbox-python` is 1.5.0, not the pinned 1.4.4.
+  `check_surrol_interface.py` run plainly: 1/5 PASS (`No module named
+  'surrol'`). With `PYTHONPATH=~/SurRoL`: 4/5 PASS, only step 1's `gym`
+  import failing — the arm itself never imports gym. §14.16's 5/5 on macOS was
+  therefore run some other way than the script describes. Until the env is
+  rebuilt from the script, collection with the Classic arm needs
+  `PYTHONPATH=~/SurRoL`.
+- Not yet collected: the Item 6 debug set (`data_debug/` does not exist). The
+  open §14.15 bite-crush finding is the reason to decide before collecting:
+  Stage B would otherwise learn the crushed bite as normal grasp behaviour.
+- The `TODO_ASSESSMENT` document cited in §14 header and in code comments
+  (`mpm_adapter.py`, `validate_dataset.py`) is not in the repo.
+
+### 14.18 19 November 2026: tuning the bite (Classic ×5), before the debug set
+
+Andric chose to tune the §14.15 bite before collecting. Every pilot below is
+the `grasp_pilot_classic.json` script (seed 0, Metal, all 24,000 particles,
+`PYTHONPATH=~/SurRoL` per §14.17) with one or two values changed; the
+trial configs were throwaway, so the values are recorded here.
+
+**Geometry, measured from the first Classic pilot.** The Classic jaw boxes
+are 51 mm long (half-extent 25.5 mm) and hang straight down from the EE frame,
+so the **jaw tips sit at EE z − 51 mm**. The settled slab top is at
+z ≈ 0.0955 m. At the original `grasp_position_m` z = 0.12 the tips reached
+**~25 mm** into the 50 mm slab. Crushing starts during the *approach*, before
+the jaws close: the open jaws plough down into the surface.
+
+`host/grasp_pilot_report.py` gained four crush columns, measured before any
+pull: particles with |det F − 1| > 0.1 at the end of the approach and at the
+end of the close, min det F at end of close, max reference-edge stretch at
+end of close. (Row 0 background: 26–32 such particles, left over from the
+drop.)
+
+| bite depth (EE z) | close | jaw stops at | held | follow 75% | crushed approach / close | min J | stretch at close | end stretch |
+|---|---|---|---|---|---|---|---|---|
+| 25 mm (0.1200), §14.16 | 0.125 s | 0 | 134 | 266 | 494 / 824 | 0.22 | 2.60 | 3.06 |
+| 15 mm (0.1315) | 0.125 s | 0 | 85 | 123 | 267 / 651 | 0.26 | 2.04 | 2.66 |
+| 8 mm (0.1385) | 0.125 s | 0 | 66 | 86 | 192 / 510 | 0.34 | 1.94 | 2.64 |
+| 15 mm | 0.5 s | 0 | 80 | 108 | 267 / 512 | 0.35 | 1.98 | 2.18 |
+| **8 mm** | **0.5 s** | **0** | **64** | **71** | **192 / 444** | **0.40** | **1.97** | **2.10** |
+| 8 mm | 0.5 s | 0.1 rad | 61 | 71 | 192 / 427 | 0.38 | 1.90 | 2.04 |
+| 8 mm | 0.5 s | 0.2 rad | 58 | 70 | 192 / 424 | 0.38 | 1.84 | 2.43 |
+
+All seven: one material piece throughout, lift exactly 20 mm.
+
+**Reading.**
+- Depth and closing speed both help; neither removes the crush. The best
+  (8 mm, 0.5 s) roughly halves the crushed count and lifts min J from 0.22 to
+  0.40, at the cost of half the held particles (134 → 64) and a quarter of the
+  tissue that follows the pull at 75% (266 → 71).
+- **Stopping the jaws short of closed does nothing useful** (444 → 424–427),
+  so the full close stays.
+- **What is left is a broad dent, not a pinch.** On the 8 mm / 0.5 s pilot,
+  361 of the 444 are compressed (J < 0.9), their median distance from the jaw
+  centre is 54 mm (p90 97 mm), about 3.5 grid cells, and only 52 are in the
+  held set. The jaws are thinner than one 15.6 mm cell, so the solver acts on
+  them through whole cells. Config knobs cannot go below that; only a finer
+  grid can (option 4 of §14.15, ~16× cost).
+- Validator on the 8 mm / 0.5 s pilot: 21 PASS, 2 WARN (det F in
+  [0.40, 1.67]; integration residual ratio 0.169, §14.14's open Item 7 rule),
+  0 FAIL.
+
+**Decided 19 Nov (Andric): 8 mm / 0.5 s, full close**, applied to
+`configs/grasp_pilot_classic.json` and `configs/grasp_debug_set.json`
+(`grasp_position_m` z 0.12 → 0.1385, `close.duration_s` 0.125 → 0.5;
+nothing else changed). Episodes are now 451 rows, not 361. The edited pilot
+config equals the trial that produced the bold row, comment aside (checked).
+Alternatives set out and not taken: keep the original bite (crush trains into
+Stage B); a finer grid (only fix for the residual dent, ~16× cost, deferred
+until Stage B shows it matters). **Carried as a known limit:** the broad
+~3-cell dent at grasp, det F down to ~0.4 locally. The debug set's ±2 cm
+grasp offset moves the grasp point over a nearly flat top, so the 8 mm depth
+should hold across episodes; check `crushed_close` on the collected set.
+`grasp_pilot.json` (the Si arm) is untouched.
+
+### 14.19 20 November 2026: the Item 6 debug set, collected; one check FAILs
+
+```
+PYTHONPATH=~/SurRoL /opt/anaconda3/envs/tissue-sim/bin/python host/collect_debug_set.py \
+    --out data_debug --particle-ids configs/particle_ids_3000.npy
+```
+
+Defaults: 4 settle (seeds 1000–1003, 240 rows), 8 grasp (seeds 1100–1107,
+413–490 rows), 4 matched variants (seed 1200; vertical and ~12° off
+vertical × 1 cm and 3 cm), all on the fixed 3,000-node set, float32 F, Metal.
+About 25 min, 1.1 GB. Every episode has its `.config.json` next to it, and
+each directory has its `collection_log.txt`.
+
+**Validator.** settle: 0 FAIL (the WARNs are "grasp never active", correct for
+settle, plus integration residual). grasp: **6 of 8 FAIL**; variants: **4 of 4
+FAIL**, all on **one** check, `logged metrics match recomputation`, in its
+lower-bound half: the 3,000-node subset's max principal stretch falls
+51–76% short of the logged full-set value (limit 50%). The upper-bound half,
+the one that catches a metric computed over the wrong particles, PASSes
+everywhere. Every other check PASSes; dataset-wide checks PASS (comparable,
+diverse deformation 31–55 mm, μ 279–11,949 Pa, one shared node set). The
+collector stops at the first FAILing directory, so **no split manifest was
+written** and the variants were validated by hand.
+
+**Why it FAILs: the §10.7 open item, now on every grasp episode.** The
+margin was calibrated at 8% on diffuse settling; a grasp concentrates the
+peak at the held particles. The solver held 25–62 particles per episode, of
+which only 3–10 are in the node set. The logged peak stretch builds up during
+retraction (e.g. seed 1103: 1.5× approach, 5.4× close, 16.9× retract,
+18.6× release) while the node graph's reference edges peak at 2.6–6.4× and
+stay in one piece. That is consistent with the peak sitting on held particles
+the subset does not record, but **it is not proven by anything in the file**:
+the file has no record of *which* particle carried the logged maximum.
+
+**The crush is mostly gravity, not the bite.** `crushed_close` varies 16–276
+nodes across episodes, uncorrelated with bite depth (2.3–10.7 mm measured
+against the local slab top). It tracks λ instead: episodes sampled with
+λ ≈ 20–30 kPa (ν 0.35–0.46) are already compressed under their own weight
+at row 0 (90–266 nodes |J−1| > 0.1); those with λ ≥ 200 kPa have zero. The
+bite's own share (end-of-close minus row 0) is 10–131 nodes against the
+tuned pilot's 88 on the same nodes, so 14.18's tuning holds across the set.
+`materials.py` ranges are placeholders and draw μ and λ independently, so
+λ/μ reaches ~2; recorded, not changed.
+
+**Bug fixed in `grasp_pilot_report.py`.** On subset episodes it measured the
+lift over an empty set of held particles, so lift read correctly only by
+accident and every `followed` count was 0. It now uses the held particles
+that were recorded (`held_recorded` column).
+
+**Not yet done:** split manifest, robot+tissue video, and a decision on the
+FAIL.
+
+**§10.7's mechanism does not hold on the tuned pilot (checked 20 Nov).** On
+the full-resolution 8 mm / 0.5 s pilot (`data_pilot/bite_8mm_slow`), the
+logged peak (4.06× end of retract, 4.15× release) sits on **non-held**
+particles ~50–60 mm from the jaw-box centre, i.e. at the bite; the held
+particles never exceed 2.24× (their F is frozen by the `F_C` zeroing,
+§10.7). Only 4 of 24,000 particles exceed 3×. And on that pilot the fixed
+node set *does* contain the peak particle: subset max = full max. So the
+debug set's 51–76% shortfall is not "the subset misses the 1–3 held
+particles"; it is most likely a handful of particles at the jaw contact,
+which the node set happens to catch on one grasp point and miss on others.
+Unverified for the debug episodes themselves, which store no full F and no
+peak-particle id.
+
+### 14.20 20 November 2026: where the logged peak stretch is, measured
+
+Andric asked for the two measurements set out after 14.19: record which
+particle carries the logged peak, and re-run the highest-peak episode with
+every particle recorded.
+
+**New fields (schema 3.0, additive; empty in every earlier file).**
+`safety_strain_id` (T,) i32, the **solver** index of the particle carrying
+the logged maximum, and `safety_strain_pos` (T,3) f32, its world position.
+Distance to the jaws is derived from `jaw_box_pose`, not stored.
+`tissue_metrics.compute_safety_strain` now also returns `argmax`, taken from
+the same stretch array as `max` (a second SVD pass would add ~39 ms per row,
+~18 s per episode). The writer refuses an id without a position, an id
+without `safety_strain`, or an id outside [0, n_sim). In `FIELD_DICTIONARY.md` §8.
+
+**New check `safety peak is consistent`.** On rows where the peak particle is
+a recorded node: its stored position must equal `safety_strain_pos` bit for
+bit, and its stored F must reproduce `safety_strain` to 1e-3. Otherwise:
+FAIL. Rows where it is not recorded are counted, not passed; SKIP if it never
+is. Tests (`tests/test_schema_v3.py::TestSafetyPeak`): PASS on a consistent
+episode, SKIP when the peak is off the node set and on older files, FAIL on a
+subset index written as a solver index and on a position one row stale.
+**The subset-index test failed against the first draft**: such an index
+usually lands on an unrecorded particle, so the exact comparison never ran
+and the check SKIPped. It now also FAILs when the id claims "not recorded"
+but the position is exactly a recorded node's. 376 passed, 1 skipped, in
+both envs.
+
+On the real solver (seed 1103's config, 3,000 nodes): the id matches the
+full-resolution re-run's argmax on 456/456 rows; 18 distinct particles carry
+the peak over the episode; the peak is a recorded node on 33 rows, all
+consistent. `check_logged_metrics_match_recomputation` is unchanged.
+
+**The re-run (seed 1103, μ = 573 Pa, λ = 616 kPa, all 24,000 particles,
+`data_pilot/debug1103_full`).** It reproduces the collected subset episode
+to 16 µm in position and 2.2e-3 in logged peak: close, **not bitwise**. The
+Metal solver is not bit-reproducible run to run (likely the order of atomic
+grid adds); §9.7's "identical cloud" is about the initial state only.
+
+| end of | logged peak | particles > 3× / > 5× | p99.9 / p99 | peak particle | recorded nodes' max |
+|---|---|---|---|---|---|
+| close | 5.42 | 86 / 2 | 3.87 / 2.19 | not held, 21 mm from jaw | 3.96 |
+| hold | 5.47 | 94 / 6 | 3.98 / 2.23 | not held, 26 mm | 4.16 |
+| retract | 16.87 | 257 / 81 | 8.31 / 3.07 | not held, 46 mm | 9.21 |
+| release | 15.66 | 233 / 69 | 7.65 / 2.96 | not held, 42 mm | 8.61 |
+| post-release | 15.29 | 222 / 66 | 7.23 / 2.93 | not held, 39 mm | 8.69 |
+
+Held particles' own max stretch: 3.5–3.7 while held (F frozen, §10.7),
+4.6 after release.
+
+**What this establishes.**
+- **The 14.19 addendum's guess is withdrawn.** It said the shortfall was "a
+  handful of particles at the jaw contact". At this material it is a
+  **zone**: 80 particles above 5×, and the peak particles were, at rest,
+  5–6 mm from the nearest held particle, i.e. the held cluster's immediate
+  neighbours, 20–60 mm from the jaw surface. The grasp constraint drags the
+  held cluster rigidly and the material next to it takes the stretch.
+- **§10.7's mechanism is wrong too**: the peak is never on held particles.
+- **The logged maximum is not noise.** p99.9 is 8.3× on the same row, so a
+  percentile definition would report the same story at about half the number.
+  Stretches of 5–17× are far past any tissue failure stretch: the simulation
+  is reporting, correctly, that the scripted grasp produces locally
+  non-tissue-like deformation next to the held cluster even after 14.18.
+- **The node set sees part of the zone** (9.2× on that row) and misses its
+  peak. The old margin check's FAILs on 6 of 8 grasp episodes were a true
+  statement that the node set cannot corroborate the peak, not a sign the
+  logged number was wrong; the new check is the exact version of that test.
+
+Note: seed 1103 (`grasp/mpm_0003`) has the debug set's highest logged peak
+but was **not** one of its 6 FAILs; its per-row shortfall stays under 50%.
+
+**Open, for Andric.** (a) What `safety_strain` should report (max, p99.9, or
+max outside a zone around the held cluster), now that the max is known to be
+a real zone, not a few particles. (b) Whether to keep the old margin half of
+`check_logged_metrics_match_recomputation` now that the exact check exists.
+(c) The bigger one: 5–17× next to the grasp means the held-cluster-dragged-
+rigidly constraint is itself the source. Re-collecting the debug set picks up
+the new fields but not a fix for that.
+
+### 14.21 20 November 2026: the grasp constraint detaches the held cluster
+
+Andric asked to investigate the constraint before re-collecting. Two full-
+resolution episodes: `data_pilot/debug1103_full` (μ = 573 Pa) and
+`data_pilot/bite_8mm_slow` (μ = 3758 Pa). Scripts were throwaway; method and
+numbers are here.
+
+**How the constraint works (`host/grasp_constraint.py`, read).** After every
+vendored `substep()` it overwrites the held particles' `F_x`, `F_v` with the
+gripper's rigid motion and zeroes their `F_C`, so their F is frozen from the
+moment of capture. Their neighbours are left to the solver.
+
+**Test 1: does stored F agree with how the particles actually moved?** For a
+particle i, fit F_geo by least squares to its rest neighbours within 12 mm:
+min Σ |(x_j − x_i) − F (X_j − X_i)|². On 30 random particles stored and
+geometric stretch agree at every phase (median 1.08 vs 1.08; 1.11 vs 1.10),
+so the method is sound. On the 30 most-stretched particles:
+
+| | stored stretch, median / max | geometric, median / max | J stored / J geometric (median) |
+|---|---|---|---|
+| μ 573, end of retract | 9.05 / 16.87 | 4.18 / 6.98 | **0.65 / 7.50** |
+| μ 573, end of episode | 8.59 / 15.29 | 3.00 / 4.71 | 0.86 / 4.26 |
+| μ 3758, end of retract | 2.15 / 4.06 | 2.12 / 3.79 | 1.04 / 1.49 |
+
+At μ 573 the neighbourhood's volume has grown 7.5× while the particles' own F
+says compressed: the material has come apart, and F no longer describes the
+motion. At μ 3758 the two mostly agree, with a milder volume opening.
+
+**Test 2: does the surrounding tissue come with the grasp?** "Shell" = the
+non-held particles within 8 mm of a held one at rest (58 and 75 particles;
+rest spacing 3.2 mm; grid dx 15.6 mm).
+
+| | μ 573 | μ 3758 |
+|---|---|---|
+| held → nearest shell gap, end of close | 7.4 mm | 6.6 mm |
+| same, end of hold (no pull yet) | 11.3 mm | 6.7 mm |
+| same, end of retract | 36.6 mm | 15.1 mm |
+| shell lift when held has risen 20 mm | 4.0 mm | 9.5 mm |
+| non-held particles within one cell of the cluster, from | end of hold on: **0** | mid-retract on: **0** |
+| after release | held cluster coasts on to 37 mm; never rejoins | rejoins partly (gap 12.6 mm) |
+
+**Reading.** The held set is 25–64 particles, about one to three grid cells
+of material. The jaws closing push the surrounding tissue away from it (the
+gap doubles before any pull at μ 573), and the pull then lifts the cluster
+out of its neighbours' interpolation reach (~1.5 cells, ~23 mm). Past that
+the cluster and the tissue no longer interact: numerical fracture, the
+§14.14 tearing at a smaller scale. The 5–17× peak is the torn edge. It is
+driven by the constraint, not by tissue mechanics: (i) the constraint moves
+the cluster by teleport, so the tissue is dragged only through the grid nodes
+it shares with the cluster, by a small mass; (ii) the cluster's F is frozen,
+so it develops no tension as it is pulled; (iii) the cluster is barely one
+grid cell, which the grid cannot attach to the rest of the tissue.
+
+**Options, not chosen.**
+- **A. Grasp as a grid boundary condition.** The standard MPM approach.
+  A host-owned substep kernel that calls the vendored `@ti.func`s in order
+  (`P2G()`, `Boundary()`, then a grasp BC, then `G2P()`) and sets every grid
+  node in the held particles' stencil to the gripper's rigid velocity.
+  No teleport, no `F_C` zeroing, so every particle's F evolves from the same
+  grid velocity it moves with. No vendored edit is needed because the three
+  are `ti.func`s, not kernels. The grip footprint becomes about 1.5 cells
+  around the held set, which is the grid's resolution, stated honestly.
+  Costs: a new kernel; proof that with no grasp it is bitwise the vendored
+  `substep()`; re-running the three smoke tests. Unknown: whether it drags
+  enough tissue at this resolution. Boundary()'s own sticky halo is already
+  a grid BC near the jaws, and the shell still did not follow, so this must
+  be measured, not assumed.
+- **B. A larger particle-held region** (everything between the jaws plus a
+  cell of margin). It keeps the teleport and the frozen F, so it moves the
+  torn edge outward without removing it. Close to §14.15's rejected option 2.
+- **C. A 128³ grid.** Halves the cell, so a cluster spans more cells; it
+  does not fix the teleport or the frozen F; ~16× cost.
+- **D. Keep the constraint, cap the pull** below detachment (a few mm at
+  μ 573). Stage B would see almost no retraction.
+
+Recommendation: prototype A on these two configs and judge it by the same
+three numbers (gap, shell lift, stored vs geometric F) before deciding.
+
+### 14.22 20 November 2026: option A prototyped, the grasp as a grid boundary condition
+
+Andric chose to prototype option A of 14.21.
+
+**What was built.**
+- `host/grasp_grid_bc.py`, `GridGraspConstraint`: a subclass of
+  `GraspConstraint` with the same membership (capture rule, release rule,
+  `full_ids()`, CONTACT_GRASP). It owns the whole substep in one kernel of its
+  own: clear grid → `P2G()` → `Boundary()` → set every grid node in the held
+  particles' 3×3×3 stencil that has mass to v_g + ω_g × (x_node − c) →
+  `G2P()`. There is no teleport and no `F_C` zeroing; `apply()` is a no-op.
+  `third_party/` is untouched: the three steps are `@ti.func`s, callable from
+  any kernel. Two Taichi constraints shaped the code. The file must not use
+  `from __future__ import annotations`, because the kernel has annotated
+  scalar arguments. And every loop stays at the kernel's top level, with the
+  "is a grasp active" test inside each loop body, because Taichi parallelises
+  only top-level loops.
+- Config key `grasp_model`: `"teleport"` (default, unchanged) or `"grid_bc"`.
+  It is recorded in each episode's sibling `.config.json`; **the .npz itself
+  does not say which was used**.
+- `MPMRecorder.advance()` calls the grasp's own `substep()` when it has one.
+- `host/smoke_test_grid_grasp.py`, 4 checks. With nothing held, the new path
+  differs from the vendored substep by 8.9e-8 m over 60 substeps, against the
+  vendored substep's own repeat spread of 6.0e-8 m (Metal is not
+  bit-reproducible, 14.20). Held particles follow the rigid path to 0.001 mm
+  over a 40 mm lift. Their F changes by ≤ 1e-7 under pure translation, with
+  no forced zeroing. And the tissue is dragged: 26.8 mm of rise 2–3 cells
+  out and 14.1 mm 3–4 cells out, for a 40 mm lift. **The first draft of the
+  drag check measured a ring 12–20 mm out**, which lies inside the BC
+  footprint, so it passed trivially (39.8 of 40 mm). The rings now start
+  beyond 2 cells.
+- `host/grasp_pilot_report.py` gained the 14.21 diagnostics as columns
+  (`gap_mm`, `shell_follow`, `top_stretch_stored/fit`, `top_J_stored/fit`;
+  full-resolution episodes only). They reproduce 14.21's teleport numbers
+  exactly.
+
+**Result.** Same configs as 14.21, all 24,000 particles, Metal.
+
+| | 1103 teleport | **1103 grid_bc** | pilot teleport | **pilot grid_bc** |
+|---|---|---|---|---|
+| held → shell gap, end of retract | 36.5 mm | **7.4 mm** | 15.9 mm | **6.6 mm** |
+| shell rise / held rise | 0.14 | **1.00** | 0.36 | **1.00** |
+| particles following > 75% of the pull | 210 | **741** | 71 | **982** |
+| top-30 stretch, stored / fitted | 9.05 / 4.18 | 3.31 / 2.65 | 2.15 / 2.12 | 2.03 / 1.70 |
+| top-30 J, stored / fitted | 0.65 / **7.50** | 1.03 / **1.07** | 1.04 / 1.49 | 0.93 / 0.97 |
+| logged peak, retract / release | 16.87 / 18.58 | **3.70 / 4.01** | 4.06 / 4.15 | **2.33 / 2.80** |
+| node-graph edge stretch, max / end | 6.36 / 4.58 | 2.89 / 1.79 | 3.17 / 2.10 | 2.15 / 1.42 |
+| last-row det F range | 0.19–2.56 | 0.91–1.14 | 0.69–1.39 | 0.78–1.29 |
+| validator | | 0 FAIL, 2 WARN | | 0 FAIL, 2 WARN |
+| wall time | 124 s | 164 s (+32%) | | |
+
+The tissue now comes with the grasp, F agrees with the motion (fitted J ≈ 1,
+not 7.5), and the peak no longer grows during retraction: it is set by the
+close (3.7×) and stays there. The remaining WARNs are the known ones (det F
+range from the bite, 14.18; integration residual, Item 7). Smoke tests after
+the adapter change: MPM 16/16 (1 expected WARN), PSM 17/17, grasp 8/8, grid
+grasp 4/4. Unit tests 376 passed, 1 skipped, both envs.
+
+**Still open.**
+- Stored stretch of the most-stretched particles still exceeds the fitted one
+  by ~20% (3.31 vs 2.65; 2.03 vs 1.70). The fit averages over 12 mm, so some
+  difference is expected; random particles agree exactly. Not investigated.
+- The grip footprint is the held particles' stencil, ~1.5 cells (~23 mm)
+  around them: larger than the jaw. It is the finest grip this grid can
+  impose; a model trained on it learns a 23 mm-wide grasp.
+- Peak speed now occurs at release (0.68 and 0.88 m/s): elastic recoil once
+  the BC stops. Not examined.
+- **Not applied to any config.** `grasp_debug_set.json` and
+  `grasp_pilot_classic.json` still default to `teleport`; `data_debug/` was
+  collected with it.
+
+### 14.23 20 November 2026: the debug set re-collected with the grid-BC grasp
+
+Andric chose to switch and re-collect. `configs/grasp_debug_set.json` now has
+`"grasp_model": "grid_bc"` (`grasp_pilot_classic.json` is unchanged, still
+`teleport`). The teleport set from 14.19 is kept as evidence in
+`data_pilot/debug_teleport/` (gitignored). Same command, seeds and node set
+as 14.19; the dry run confirmed the matched variants inherit `grid_bc`.
+
+**Validator.** settle 4/4: 0 FAIL. variants 4/4: 0 FAIL. grasp: **2 of 8
+FAIL** (14.19: 6 of 8), both on the old margin half of
+`logged metrics match recomputation` (57% short of the logged peak, limit
+50%). The collector stops at a FAIL directory, so **no split manifest was
+written again**. Every other check PASSes. The new exact check
+`safety peak is consistent` PASSes on all 12 grasp and variant episodes: the
+peak particle is a recorded node on 4–230 rows per episode, consistent every
+time.
+
+**Where the peak is now** (from `safety_strain_id`, the first collection to
+have it):
+
+| | teleport (14.19) | grid_bc |
+|---|---|---|
+| logged peak, range over 12 episodes | 4.3–18.6× | **2.55–5.07×** |
+| peak particle | the held cluster's neighbours (14.20) | a **held** particle in 10 of 12, mostly at release; 0001 and 0004: a non-held particle at the close |
+| peak displacement range across grasp episodes | 31–55 mm | 25–32 mm |
+
+The two FAILs: **0001** (μ 11,949 Pa) peaks at 2.55× during the close on a
+non-held particle 23 mm (rest) from the held set, 24 mm from the jaw: the
+bite (14.18), not the pull. **0006** (μ 7,379 Pa) peaks at 5.07× at release
+on a held particle 12 mm from the jaw. In both the peak particle is usually
+not a recorded node, which is exactly what the margin check is guessing at.
+The exact check answers it directly.
+
+**Not yet investigated:** why held particles reach 3–5× at release. With
+the grid BC their F evolves (it was frozen under the teleport), so release
+is the first time they are free to spring back; 14.22 also saw the peak
+speed move to release.
+
+**Open, for Andric (14.20 (b), now concrete).** The margin half of the old
+check was a stand-in for "is the logged peak on a recorded node". The exact
+check now answers that, and it passes everywhere. Options: (1) downgrade the
+margin half to WARN when `safety_strain_id` is present, and keep it as a
+FAIL for older files; (2) keep it as a FAIL and drop 0001 and 0006 from the
+set; (3) keep it and widen the margin. (1) is the recommendation: (2)
+throws away valid data, and (3) is a number with no failure story.
+
+### 14.24 21 November 2026: the margin check downgraded; the Item 6 set validates
+
+Andric chose option (1) of 14.23.
+
+**The change (`check_logged_metrics_match_recomputation`).** The
+subset-margin half (the subset's peak stretch falling more than 50% short of
+the logged full-set value) is now a **WARN when the file records
+`safety_strain_id`**, with the reason in the message. For every older file
+it is still a FAIL. Untouched: the impossible direction (subset peak *above*
+the logged value) is a FAIL with or without the id, and so are the exposure
+bounds. Tests in `tests/test_schema_v3.py::TestMarginDowngrade`: without the
+id the margin FAILs; with it, it WARNs; with the id, a logged value below the
+subset maximum still FAILs. 379 passed, 1 skipped, both envs.
+
+`host/collect_debug_set.py --validate-only` skips simulation, then validates
+and writes the manifest. I used it to resume after the 14.23 stop; the
+variant configs it rewrites were byte-identical (md5 checked).
+
+**The Item 6 debug set, validated.**
+
+| directory | episodes | PASS / WARN / FAIL (all checks) |
+|---|---|---|
+| settle | 4 | 63 / 12 / 0 |
+| grasp | 8 | 172 / 16 / 0 (0001 and 0006: margin WARN, as above) |
+| variants | 4 | 87 / 9 / 0 |
+
+The remaining WARNs are known: integration residual (Item 7's rule), det F
+range from the bite, "grasp never active" on settle, and "material barely
+varies" on the variants (one shared seed, by design for Item 12).
+
+**`data_debug/split_manifest.json`** picks held-out episodes before any
+windowing and hashes every file. Held out: `settle/mpm_0002` and
+`grasp/mpm_0006`. The 4 variants are one group on the train side; the
+manifest notes that nothing of that task is held out, so Item 12 results on
+them are a debug result, not generalisation.
+
+**Video (Item 6's last deliverable).** `runs/video/debug_grasp_0003_gridbc.gif`
+(gitignored, regenerable): `python host/render_video.py
+data_debug/grasp/mpm_0003.npz --out runs/video/debug_grasp_0003_gridbc.mp4`,
+229 frames. It is a **GIF, not MP4**, 28 MB: neither env has ffmpeg, so the
+script falls back to a GIF. `pip install imageio-ffmpeg` or `brew install
+ffmpeg` fixes it; not installed. Checked by eye at t = 1.04 s and 1.48 s
+(retract): the slab stays in one piece, tissue tents up under the jaws, and
+spatial-only edges collect where it folds near the grip.
+
+Item 6's deliverables now exist: the collection command and configs, the
+validated files, the split manifest, and the video. Nothing is committed.

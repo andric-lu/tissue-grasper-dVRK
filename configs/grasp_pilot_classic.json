@@ -1,0 +1,59 @@
+{
+  "_comment": "Option 3 with option 1 (DECISION_LOG 14.15): SurRoL's Classic Psm1 at x5 (SurRoL's own task scaling), RCM 0.6 m above the slab centre so the tool is vertical, grasp pivot at z = 0.1385 m so the 51 mm jaws reach ~8 mm into the 5 cm slab (settled top 0.0955 m), closing over 0.5 s (bite tuned in DECISION_LOG 14.18; was z = 0.12 m, ~25 mm deep, 0.125 s close); 4 cm vertical approach at 0.1 m/s, 2 cm retraction straight up the insertion axis at 4 cm/s. Orientation = ClassicPSM.tip_down_quat() (all arm joints zero). jaw is SurRoL's TOTAL opening (80 deg open). Units m, s, rad.",
+  "frame_dt_s": 0.004166666666666667,
+  "arm": {
+    "model": "classic",
+    "scaling": 5.0,
+    "rcm_position_m": [
+      0.25,
+      0.35,
+      0.6
+    ]
+  },
+  "orientation_xyzw": [
+    -0.7071067811865476,
+    -0.7071067811865476,
+    0.0,
+    0.0
+  ],
+  "grasp_position_m": [
+    0.25,
+    0.35,
+    0.1385
+  ],
+  "approach": {
+    "direction_from_grasp": [
+      0,
+      0,
+      1
+    ],
+    "distance_m": 0.04,
+    "duration_s": 0.4
+  },
+  "jaw": {
+    "open_rad": 1.3962634015954636,
+    "closed_rad": 0.0
+  },
+  "retract": {
+    "direction": [
+      0,
+      0,
+      1
+    ],
+    "distance_m": 0.02,
+    "duration_s": 0.5
+  },
+  "preroll_s": 1.0,
+  "close": {
+    "duration_s": 0.5
+  },
+  "hold": {
+    "duration_s": 0.1
+  },
+  "release": {
+    "duration_s": 0.125
+  },
+  "post_release": {
+    "duration_s": 0.25
+  }
+}

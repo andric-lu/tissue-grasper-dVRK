@@ -552,9 +552,11 @@ class TestRunner:
         the older versions are asserted here too rather than just the new one.
         """
         from trajectory_io import KNOWN_SCHEMA_VERSIONS
-        assert SCHEMA_VERSION == "2.1"
+        assert SCHEMA_VERSION == "3.0"
         assert SCHEMA_VERSION in KNOWN_SCHEMA_VERSIONS
-        # data/ is v1.0 and the synthetic episodes are v2.0. Dropping either
-        # from the reader would strand data that is still on disk.
-        for older in ("1.0", "2.0"):
+        # data/ is v1.0, the synthetic episodes are v2.0, and every MPM episode
+        # collected before schema 3.0 is v2.1. Dropping any of them from the
+        # reader would strand data that is still on disk (3.0 only ADDS fields;
+        # _upgrade_in_place fills them as empty "not recorded" arrays).
+        for older in ("1.0", "2.0", "2.1"):
             assert older in KNOWN_SCHEMA_VERSIONS

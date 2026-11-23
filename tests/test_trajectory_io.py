@@ -155,7 +155,7 @@ class TestEncodingIsValidated:
 
 class TestSchemaCompatibility:
     def test_current_version_is_known(self):
-        assert SCHEMA_VERSION == "2.1"
+        assert SCHEMA_VERSION == "3.0"
         assert SCHEMA_VERSION in KNOWN_SCHEMA_VERSIONS
 
     def test_older_versions_are_still_readable(self):

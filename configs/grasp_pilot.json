@@ -1,0 +1,40 @@
+{
+  "_comment": "Option 1 on the Si arm (DECISION_LOG 14.15): the section 10 grasp point and tool orientation, but a short, slow pull -- 4 cm approach at 0.1 m/s, 2 cm retraction at 4 cm/s (the section 10 script pulled 14 cm at 0.56 m/s and tore a 12-particle strand out of the slab, 14.14). 1.0 s settle pre-roll (14.14: mean speed 0.4 mm/s by then). Units m, s, rad; jaw is the Si PER-JAW angle.",
+  "frame_dt_s": 0.004166666666666667,
+  "arm": {
+    "model": "si",
+    "scaling": 1.0,
+    "rcm_position_m": null
+  },
+  "approach": {
+    "direction_from_grasp": [
+      0.15743228452699531,
+      0.0,
+      0.9875297847602426
+    ],
+    "distance_m": 0.04,
+    "duration_s": 0.4
+  },
+  "retract": {
+    "direction": [
+      0.15743228452699531,
+      0.0,
+      0.9875297847602426
+    ],
+    "distance_m": 0.02,
+    "duration_s": 0.5
+  },
+  "preroll_s": 1.0,
+  "close": {
+    "duration_s": 0.125
+  },
+  "hold": {
+    "duration_s": 0.1
+  },
+  "release": {
+    "duration_s": 0.125
+  },
+  "post_release": {
+    "duration_s": 0.25
+  }
+}

@@ -411,3 +411,125 @@ def median_nn_distance(pos: ArrayLike) -> float:
         d2[np.arange(q.shape[0]), np.arange(a, a + q.shape[0])] = np.inf
         nn[a:a + _CHUNK] = np.sqrt(np.maximum(d2.min(axis=1), 0.0))
     return float(np.median(nn))
+
+
+# --------------------------------------------------------------------------
+# To-do Item 3: the three samplers it names, and the statistics it asks for
+# --------------------------------------------------------------------------
+
+def random_sample(n_total: int, n: int, seed: int = 0) -> np.ndarray:
+    """n indices uniformly without replacement, sorted. The baseline sampler:
+    MPM particle index carries no spatial structure here, so this is a
+    spatially uniform draw with Poisson clumping and gaps."""
+    if not 0 < n <= n_total:
+        raise ValueError(f"n must be in [1, {n_total}], got {n}")
+    return np.sort(np.random.default_rng(seed).choice(n_total, n, replace=False))
+
+
+def voxel_sample(pos: ArrayLike, n: int) -> np.ndarray:
+    """Voxel/grid sampling: one particle per occupied voxel, voxel size solved
+    so the occupied count is as close to n as a cubic grid allows.
+
+    In each occupied voxel the particle nearest the voxel's own particle
+    centroid is kept (a real particle, so its trajectory exists; the centroid
+    rather than the voxel centre, so a voxel only partly filled by material is
+    represented where its material is). Unlike lattice_sample this never puts
+    a node outside the material, and the count follows the occupied volume,
+    so the returned size is reported by the caller rather than assumed.
+    Sorted and unique.
+    """
+    p = np.asarray(pos, np.float64)
+    N = p.shape[0]
+    if not 0 < n <= N:
+        raise ValueError(f"n must be in [1, {N}], got {n}")
+    lo = p.min(axis=0)
+
+    def occupied(s):
+        keys = np.floor((p - lo) / s).astype(np.int64)
+        _, inv = np.unique(keys, axis=0, return_inverse=True)
+        return inv.ravel()
+
+    ext = float((p.max(axis=0) - lo).max())
+    s_lo, s_hi = ext * 1e-4, ext * 2
+    best = None
+    for _ in range(60):                 # occupied count is monotone non-increasing in s
+        mid = 0.5 * (s_lo + s_hi)
+        inv = occupied(mid)
+        k = int(inv.max()) + 1
+        if best is None or abs(k - n) < abs(best[1] - n):
+            best = (mid, k, inv)
+        if k > n:
+            s_lo = mid
+        else:
+            s_hi = mid
+    _, k, inv = best
+    counts = np.bincount(inv, minlength=k)
+    cent = np.zeros((k, 3))
+    for d in range(3):
+        cent[:, d] = np.bincount(inv, weights=p[:, d], minlength=k) / counts
+    d2 = np.einsum("ij,ij->i", p - cent[inv], p - cent[inv])
+    order = np.lexsort((d2, inv))       # by voxel, nearest-to-centroid first
+    first = np.ones(N, bool)
+    first[1:] = inv[order][1:] != inv[order][:-1]
+    return np.sort(order[first])
+
+
+def coverage_stats(all_pos: ArrayLike, node_pos: ArrayLike) -> Dict[str, float]:
+    """How well the nodes cover the material: distance from EVERY simulated
+    particle to its nearest node. Max is the worst-represented spot; p95 the
+    typical gap. Metres."""
+    a = np.asarray(all_pos, np.float64)
+    b = np.asarray(node_pos, np.float64)
+    b_sq = np.einsum("ij,ij->i", b, b)
+    best = np.empty(a.shape[0])
+    for s in range(0, a.shape[0], _CHUNK):
+        q = a[s:s + _CHUNK]
+        d2 = np.einsum("ij,ij->i", q, q)[:, None] - 2.0 * q @ b.T + b_sq[None, :]
+        best[s:s + _CHUNK] = np.sqrt(np.maximum(d2.min(axis=1), 0.0))
+    return {"max": float(best.max()), "p95": float(np.percentile(best, 95)),
+            "mean": float(best.mean())}
+
+
+def edge_length_stats(pos: ArrayLike, edge_index: ArrayLike) -> Dict[str, float]:
+    """Percentiles of current edge length, metres. Empty graph -> NaNs."""
+    e = np.asarray(edge_index)
+    if e.shape[1] == 0:
+        return {k: float("nan") for k in ("min", "p05", "median", "p95", "max")}
+    p = np.asarray(pos, np.float64)
+    L = np.linalg.norm(p[e[1]] - p[e[0]], axis=1)
+    return {"min": float(L.min()), "p05": float(np.percentile(L, 5)),
+            "median": float(np.median(L)), "p95": float(np.percentile(L, 95)),
+            "max": float(L.max())}
+
+
+def graph_summary(pos: ArrayLike, edge_index: ArrayLike,
+                  surface: Optional[ArrayLike] = None) -> Dict[str, object]:
+    """The per-graph numbers Item 3 asks for, in one dict.
+
+    `surface` (N,) bool, optional: degree is then also reported separately for
+    surface and interior nodes. On a slab a few node-spacings thick a surface
+    node loses about half its neighbourhood to empty space, so one overall
+    mean hides a population of under-connected nodes (Phase 0, section 13.4).
+    """
+    p = np.asarray(pos, np.float64)
+    n = p.shape[0]
+    e = np.asarray(edge_index)
+    deg = degrees(e, n)
+    n_comp, labels = connected_components(e, n)
+    sizes = np.bincount(labels)
+    out = {
+        "n_nodes": int(n),
+        "n_edges": int(e.shape[1]),
+        "isolated": int((deg == 0).sum()),
+        "components": int(n_comp),
+        "largest_component_frac": float(sizes.max() / n),
+        "deg_mean": float(deg.mean()), "deg_min": int(deg.min()),
+        "deg_p05": float(np.percentile(deg, 5)), "deg_median": float(np.median(deg)),
+        "deg_p95": float(np.percentile(deg, 95)), "deg_max": int(deg.max()),
+    }
+    out.update({f"len_{k}": v for k, v in edge_length_stats(p, e).items()})
+    if surface is not None:
+        s = np.asarray(surface, bool)
+        out["deg_mean_surface"] = float(deg[s].mean()) if s.any() else float("nan")
+        out["deg_mean_interior"] = float(deg[~s].mean()) if (~s).any() else float("nan")
+    return out

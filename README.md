@@ -58,12 +58,13 @@ machine or cluster, where Taichi's CUDA build and GPU access both work.
 
 | Path | Runs on | Contents |
 |---|---|---|
-| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema v2.1), `actions.py`, `materials.py`, `tissue_metrics.py`, `synthetic_traj.py`, `graph_design.py` (GNN node sampling / radius graphs) |
-| `host/` | macOS | `environment.yml`, `verify_host.py`, `train_dynamics.py`, `visualize_trajectory.py`, `validate_dataset.py`; MPM: `mpm_adapter.py`, `psm.py`, `grasp_constraint.py`, `visualize_grasp.py`, `smoke_test_{mpm,psm,grasp}.py` |
+| `src/` | **both** | The shared layer — `trajectory_io.py` (data contract, schema 3.0; fields in `docs/FIELD_DICTIONARY.md`), `actions.py`, `materials.py`, `tissue_metrics.py`, `synthetic_traj.py`, `graph_design.py` (node sampling, graph statistics), `graph_builder.py` (the hybrid particle graph), `tool_geometry.py` (jaw-box distance, node contact/grasp rules), `collection_config.py` (scripted grasp in physical units), `split_manifest.py` |
+| `host/` | macOS | `environment.yml`, `verify_host.py`, `train_dynamics.py`, `visualize_trajectory.py`, `validate_dataset.py`; MPM: `mpm_adapter.py`, `psm.py`, `grasp_constraint.py`, `visualize_grasp.py`, `smoke_test_{mpm,psm,grasp}.py`; graph: `sampling_study.py` (Item 3), `visualize_graph.py` (Item 4), `collect_debug_set.py` (Item 6), `check_surrol_interface.py`, `psm_classic.py` (SurRoL Classic arm), `grasp_pilot_report.py`, `setup_tissue_sim.sh` |
 | `container/` | Linux | `verify_container.py`, `make_tissue_mesh.py`, `collect_retraction.py`, `timestep_study.py`, `validate_physics.py` |
-| `tests/` | macOS | 278 unit tests over the `src/` layer and the validator |
+| `tests/` | **both** | 370 unit tests over the `src/` layer, the validator, the graph builder, and the adapter's bookkeeping (against numpy stand-ins for the solver) |
 | `third_party/`, `psm_Si_model/` | host | Vendored Taichi MPM solver and dVRK Si PSM model (see `PROVENANCE.md` in each) |
 | `logs/` | — | Setup guide, cheatsheet, decision log, session transcript |
+| `docs/`, `configs/` | — | Episode field dictionary; collection configs and fixed node sets |
 | `docker/` | — | `Dockerfile` |
 | `data/`, `data_synth/`, `data_mpm*/`, `models/` | **both** | Trajectories and checkpoints (git-ignored) |
 
@@ -90,6 +91,20 @@ python host/validate_dataset.py --data data/
 
 # train on the Apple GPU
 python host/train_dynamics.py --data data --epochs 100
+```
+
+Schema-3.0 MPM collection and the graph (to-do Items 1–6; `logs/DECISION_LOG.md` §14):
+
+```bash
+python host/mpm_adapter.py --task settle --out data_pilot/settle --n-record all --steps 240
+python host/mpm_adapter.py --task grasp --config configs/grasp_pilot.json --out data_pilot/grasp --n-record all   # Si arm, short pull
+# Classic arm x5 through SurRoL (needs the tissue-sim env: bash host/setup_tissue_sim.sh)
+python host/mpm_adapter.py --task grasp --config configs/grasp_pilot_classic.json --out data_pilot/grasp_classic --n-record all
+python host/grasp_pilot_report.py data_pilot/grasp*/mpm_0000.npz --ids configs/particle_ids_3000.npy   # retraction or tearing?
+python host/sampling_study.py --episode data_pilot/grasp/mpm_0000.npz --recommend --write-ids configs/particle_ids_3000.npy
+python host/visualize_graph.py data_pilot/grasp/mpm_0000.npz --ids configs/particle_ids_3000.npy --r-dx 1.5
+python host/collect_debug_set.py --out data_debug --particle-ids configs/particle_ids_3000.npy
+python host/smoke_test_grid_grasp.py      # the grid-BC grasp ("grasp_model": "grid_bc"), DECISION_LOG 14.22
 ```
 
 Health checks:
